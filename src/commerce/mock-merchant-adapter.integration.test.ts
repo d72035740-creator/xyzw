@@ -102,7 +102,7 @@ describe("MockMerchantAdapter on live PostgreSQL", () => {
     });
     const previousMissionVersion = beforeChange.version;
 
-    const change = await adapter.simulateOfferChange(r1.id, r1.version, { amount: 635000 });
+    const change = await adapter.simulateOfferChange(r1.id, r1.version, { amount: 635000 }, mission.id);
     expect(change).toMatchObject({ changed: true, changedFields: ["amount"] });
     expect(change.invalidations).toHaveLength(1);
 
@@ -117,6 +117,7 @@ describe("MockMerchantAdapter on live PostgreSQL", () => {
       reservedAmount: 765000,
       committedAmount: 0,
     });
+    expect(afterChange.reservedAmount + 80000).toBe(845000);
     expect(currentR1).toMatchObject({ amount: 635000, version: r1.version + 1 });
     expect(checkedCake?.status).toBe("HELD");
     expect(checkedFlowers?.status).toBe("HELD");

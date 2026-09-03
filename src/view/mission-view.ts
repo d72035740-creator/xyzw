@@ -16,6 +16,7 @@ import {
 } from "@/db/schema";
 import type { MissionStatus } from "@/domain/mission-state";
 import { isDemoMutationEnabled } from "@/demo/demo-safety";
+import { isMissionPaymentFrozen } from "@/payments/payment-freeze";
 
 export type MissionView = Awaited<ReturnType<MissionViewService["get"]>>;
 
@@ -233,7 +234,7 @@ export function buildMissionView(input: MissionViewInput) {
     availableActions: {
       canPlan: mission.status === "DRAFT",
       canRepair: mission.status === "INVALIDATED",
-      canSimulateMarketChange: input.demoMutationsEnabled && mission.status === "READY_TO_COMMIT" && currentReservations.some((reservation) => reservation.offerCode === "R1"),
+      canSimulateMarketChange: input.demoMutationsEnabled && !isMissionPaymentFrozen(mission) && mission.status === "READY_TO_COMMIT" && currentReservations.some((reservation) => reservation.offerCode === "R1"),
       canResetDemo: input.demoMutationsEnabled,
       canProceedToPayment: mission.status === "READY_TO_COMMIT" && mission.committedAmount === 0 && Boolean(process.env.RAZORPAY_KEY_ID),
       canRetryPayment: mission.status === "PAYMENT_FAILED",

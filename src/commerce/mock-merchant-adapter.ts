@@ -4,6 +4,7 @@ import { merchants, missionEvents, missionItems, missions, offers, reservations 
 import { assertTransition } from "@/domain/mission-state";
 import { MissionAuthority } from "@/services/mission-authority";
 import { PostgresMissionAuthorityStore } from "@/services/postgres-authority-store";
+import { isMissionPaymentFrozen } from "@/payments/payment-freeze";
 import type {
   MerchantAdapter,
   MerchantOffer,
@@ -240,6 +241,7 @@ export class MockMerchantAdapter implements MerchantAdapter {
     offerId: string,
     expectedOfferVersion: number,
     changes: OfferChanges,
+    targetMissionId?: string,
   ): Promise<SimulateOfferChangeResult> {
     if (changes.amount !== undefined && (!Number.isSafeInteger(changes.amount) || changes.amount <= 0)) {
       throw new MerchantError("INVALID_OFFER_CHANGE", "Offer amount must be positive integer paise");
@@ -269,6 +271,7 @@ export class MockMerchantAdapter implements MerchantAdapter {
             expectedOfferVersion,
             changes,
             knownMissionIds,
+            targetMissionId,
           ),
         );
       } catch (error) {
@@ -289,6 +292,7 @@ export class MockMerchantAdapter implements MerchantAdapter {
     expectedOfferVersion: number,
     changes: OfferChanges,
     knownMissionIds: string[],
+    targetMissionId?: string,
   ): Promise<SimulateOfferChangeResult> {
     const lockedMissions =
       knownMissionIds.length > 0
@@ -299,7 +303,10 @@ export class MockMerchantAdapter implements MerchantAdapter {
             .orderBy(asc(missions.id))
             .for("update")
         : [];
-    if (lockedMissions.some((mission) => mission.status === "PAYMENT_PENDING")) {
+    const targetMission = targetMissionId
+      ? lockedMissions.find((mission) => mission.id === targetMissionId)
+      : undefined;
+    if (targetMission && isMissionPaymentFrozen(targetMission)) {
       throw new MerchantError("INVALID_OFFER_CHANGE", "Merchant terms are frozen while MissionPay payment is pending", 409);
     }
 
@@ -363,14 +370,20 @@ export class MockMerchantAdapter implements MerchantAdapter {
 
     const missionById = new Map(lockedMissions.map((mission) => [mission.id, mission]));
     const invalidations: SimulateOfferChangeResult["invalidations"] = [];
+    const frozenMissionIds = new Set(
+      lockedMissions.filter(isMissionPaymentFrozen).map((mission) => mission.id),
+    );
+    // A held reservation belonging to another mission's active checkout is a
+    // binding snapshot. Keep it untouched while invalidating mutable missions.
     const staleReservations = heldReservations.filter(
       (reservation) =>
-        reservation.offerVersion !== economicChange.newOffer.version ||
-        reservation.amount !== economicChange.newOffer.amount ||
-        reservation.offerAvailable !== economicChange.newOffer.available ||
-        reservation.readyAt?.getTime() !== economicChange.newOffer.readyAt.getTime() ||
-        reservation.offerVegetarian !== economicChange.newOffer.vegetarian ||
-        reservation.offerServesPeople !== economicChange.newOffer.servesPeople,
+        !frozenMissionIds.has(reservation.missionId) &&
+        (reservation.offerVersion !== economicChange.newOffer.version ||
+          reservation.amount !== economicChange.newOffer.amount ||
+          reservation.offerAvailable !== economicChange.newOffer.available ||
+          reservation.readyAt?.getTime() !== economicChange.newOffer.readyAt.getTime() ||
+          reservation.offerVegetarian !== economicChange.newOffer.vegetarian ||
+          reservation.offerServesPeople !== economicChange.newOffer.servesPeople),
     );
     const reservationsByMission = new Map<string, typeof staleReservations>();
     for (const reservation of staleReservations) {

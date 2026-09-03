@@ -7,6 +7,7 @@ import { isDemoMutationEnabled } from "@/demo/demo-safety";
 const changeSchema = z
   .object({
     expectedOfferVersion: z.number().int().positive(),
+    missionId: z.uuid(),
     amount: z.number().int().positive().optional(),
     available: z.boolean().optional(),
     readyAt: z.coerce.date().optional(),
@@ -40,11 +41,12 @@ export async function POST(
       );
     }
     const { offerId } = await context.params;
-    const { expectedOfferVersion, ...changes } = parsed.data;
+    const { expectedOfferVersion, missionId, ...changes } = parsed.data;
     const result = await mockMerchantAdapter.simulateOfferChange(
       offerId,
       expectedOfferVersion,
       changes,
+      missionId,
     );
     return Response.json(result);
   } catch (error) {

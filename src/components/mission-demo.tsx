@@ -102,9 +102,10 @@ export function MissionDemo() {
 
   async function simulateChange() {
     const r1 = view?.reservations.find((reservation) => reservation.isCurrent && reservation.offerCode === "R1");
-    if (!r1) return;
+    const missionId = view?.mission.id;
+    if (!r1 || !missionId) return;
     await run("changing", async () => {
-      await api(`/api/dev/offers/${r1.offerId}/simulate-change`, { method: "POST", body: JSON.stringify({ expectedOfferVersion: r1.offerVersion, amount: 635000 }) });
+      await api(`/api/dev/offers/${r1.offerId}/simulate-change`, { method: "POST", body: JSON.stringify({ missionId, expectedOfferVersion: r1.offerVersion, amount: 635000 }) });
       await refresh();
     });
   }
