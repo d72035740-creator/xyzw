@@ -312,6 +312,78 @@ export const razorpayWebhookEvents = pgTable(
   },
 );
 
+export const continuityMissions = pgTable("continuity_missions", {
+  missionId: uuid("mission_id").primaryKey().references(() => missions.id),
+  spec: jsonb("spec").$type<Record<string, unknown>>().notNull(),
+  marketMode: text("market_mode").notNull(),
+  outcomeStatus: text("outcome_status").notNull().default("PLANNED"),
+  repairAllowancePaise: integer("repair_allowance_paise").notNull().default(0),
+  allowAutomaticSubstitution: boolean("allow_automatic_substitution").notNull().default(true),
+  ...timestamps,
+}, (table) => [
+  check("continuity_repair_allowance_nonnegative", sql`${table.repairAllowancePaise} >= 0`),
+  check("continuity_market_mode_valid", sql`${table.marketMode} IN ('live', 'sandbox')`),
+]);
+
+export const marketSearches = pgTable("market_searches", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id").notNull(),
+  connectorId: text("connector_id").notNull(),
+  query: text("query").notNull(),
+  status: text("status").notNull(),
+  resultCount: integer("result_count").notNull().default(0),
+  errorCode: text("error_code"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("market_searches_mission_idx").on(table.missionId)]);
+
+export const marketOfferSnapshots = pgTable("market_offer_snapshots", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id").notNull(),
+  sourceProvider: text("source_provider").notNull(),
+  externalId: text("external_id"),
+  sourceUrl: text("source_url"),
+  merchantName: text("merchant_name").notNull(),
+  title: text("title").notNull(),
+  description: text("description"),
+  pricePaise: integer("price_paise").notNull(),
+  currency: varchar("currency", { length: 3 }).notNull().default("INR"),
+  availability: text("availability").notNull(),
+  attributes: jsonb("attributes_json").$type<Record<string, unknown>>().notNull().default({}),
+  reversibility: jsonb("reversibility_json").$type<Record<string, unknown>>(),
+  evidence: jsonb("evidence_json").$type<Record<string, unknown>>(),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+  sourceVersion: text("source_version").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("market_offer_snapshots_mission_need_idx").on(table.missionId, table.needId),
+  check("market_offer_snapshots_price_positive", sql`${table.pricePaise} > 0`),
+]);
+
+export const continuitySelections = pgTable("continuity_selections", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id").notNull(),
+  snapshotId: uuid("snapshot_id").notNull().references(() => marketOfferSnapshots.id),
+  status: text("status").notNull().default("SELECTED"),
+  reservedPricePaise: integer("reserved_price_paise").notNull(),
+  replacedSelectionId: uuid("replaced_selection_id"),
+  ...timestamps,
+}, (table) => [
+  index("continuity_selections_mission_idx").on(table.missionId),
+  check("continuity_selection_price_positive", sql`${table.reservedPricePaise} > 0`),
+]);
+
+export const missionOutcomeEvents = pgTable("mission_outcome_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id"),
+  type: text("type").notNull(),
+  data: jsonb("data").$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("mission_outcome_events_mission_idx").on(table.missionId)]);
+
 export const missionRelations = relations(missions, ({ many }) => ({
   items: many(missionItems),
   reservations: many(reservations),

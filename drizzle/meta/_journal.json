@@ -43,6 +43,13 @@
       "when": 1788439936271,
       "tag": "0005_milky_millenium_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788472281972,
+      "tag": "0006_past_fat_cobra",
+      "breakpoints": true
     }
   ]
 }

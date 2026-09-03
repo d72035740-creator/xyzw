@@ -2,7 +2,8 @@ import { and, desc, eq } from "drizzle-orm";
 import { db, type Database } from "@/db/client";
 import { assertTransition } from "@/domain/mission-state";
 import { MissionError } from "@/domain/errors";
-import { merchants, missionEvents, missionItems, missionPaymentOrders, missions, offers, paymentAttempts, reservations } from "@/db/schema";
+import { continuityMissions, continuitySelections, marketOfferSnapshots, merchants, missionEvents, missionItems, missionOutcomeEvents, missionPaymentOrders, missions, offers, paymentAttempts, reservations } from "@/db/schema";
+import { missionSpecSchema } from "@/continuity/types";
 import { PaymentError } from "./payment-errors";
 import type { PaymentProvider, ProviderPayment } from "./payment-provider";
 
@@ -105,6 +106,20 @@ export class MissionPaymentService {
 
   private async authoritativePaymentAmount(transaction: DbTransaction, mission: typeof missions.$inferSelect): Promise<number> {
     if (mission.committedAmount !== 0 || mission.reservedAmount <= 0 || mission.reservedAmount > mission.budgetAmount) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Mission has no legally payable authority");
+    const [continuity] = await transaction.select().from(continuityMissions).where(eq(continuityMissions.missionId, mission.id));
+    if (continuity) {
+      if (continuity.outcomeStatus === "DEGRADED" || continuity.outcomeStatus === "HUMAN_REAUTH_REQUIRED") throw new PaymentError("PAYMENT_NOT_ALLOWED", "Mission outcome has unresolved degradation");
+      const selected = await transaction.select({ needId: continuitySelections.needId, amount: continuitySelections.reservedPricePaise, observedAt: marketOfferSnapshots.observedAt })
+        .from(continuitySelections).innerJoin(marketOfferSnapshots, eq(continuitySelections.snapshotId, marketOfferSnapshots.id))
+        .where(and(eq(continuitySelections.missionId, mission.id), eq(continuitySelections.status, "SELECTED")));
+      const spec = missionSpecSchema.parse(continuity.spec);
+      if (selected.length !== spec.needs.length || new Set(selected.map((row) => row.needId)).size !== spec.needs.length) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Mission is missing selected continuity components");
+      const freshnessSeconds = Number(process.env.MISSIONPAY_MARKET_FRESHNESS_SECONDS ?? 60);
+      if (selected.some((row) => Date.now() - row.observedAt.getTime() > freshnessSeconds * 1000)) throw new PaymentError("PAYMENT_NOT_ALLOWED", "STALE_MARKET_STATE: revalidate live offers before payment", 409);
+      const sum = selected.reduce((total, row) => total + row.amount, 0);
+      if (sum !== mission.reservedAmount) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Persisted continuity total does not match mission authority");
+      return sum;
+    }
     const rows = await transaction.select({ itemId: missionItems.id, required: missionItems.required, reservationId: missionItems.reservationId, reservationStatus: reservations.status, reservedAmount: reservations.amount, offerAmount: offers.amount, offerVersion: offers.version, reservedOfferVersion: reservations.offerVersion, offerReadyAt: offers.readyAt, reservedReadyAt: reservations.readyAt, offerAvailable: offers.available, reservedAvailable: reservations.offerAvailable, offerVegetarian: offers.vegetarian, reservedVegetarian: reservations.offerVegetarian, offerServesPeople: offers.servesPeople, reservedServesPeople: reservations.offerServesPeople, category: merchants.category }).from(missionItems).leftJoin(reservations, eq(missionItems.reservationId, reservations.id)).leftJoin(offers, eq(reservations.offerId, offers.id)).leftJoin(merchants, eq(offers.merchantId, merchants.id)).where(eq(missionItems.missionId, mission.id));
     const required = (rows as PayableRow[]).filter((row) => row.required);
     if (required.some((row) => !row.reservationId || row.reservationStatus !== "ACTIVE" || row.offerAvailable !== true || row.offerVersion !== row.reservedOfferVersion || row.offerAmount !== row.reservedAmount || !row.offerReadyAt || row.offerReadyAt > mission.deadline || row.offerReadyAt.getTime() !== row.reservedReadyAt?.getTime() || row.offerVegetarian !== row.reservedVegetarian || row.offerServesPeople !== row.reservedServesPeople)) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Mission terms are no longer valid for payment");
@@ -151,6 +166,11 @@ export class MissionPaymentService {
       }
       await transaction.update(missions).set({ status: "PAID", reservedAmount: 0, committedAmount: mission.committedAmount + order.amount, version: nextVersion, updatedAt: new Date() }).where(eq(missions.id, mission.id));
       await transaction.update(missionPaymentOrders).set({ status: "CAPTURED", updatedAt: new Date() }).where(eq(missionPaymentOrders.id, order.id));
+      const [continuity] = await transaction.select().from(continuityMissions).where(eq(continuityMissions.missionId, mission.id));
+      if (continuity) {
+        await transaction.update(continuityMissions).set({ outcomeStatus: "ACTIVE", updatedAt: new Date() }).where(eq(continuityMissions.missionId, mission.id));
+        await transaction.insert(missionOutcomeEvents).values({ missionId: mission.id, type: "OUTCOME_ACTIVATED_AFTER_PAYMENT", data: { status: "UNVERIFIED", paymentOrderId: order.id } });
+      }
       await transaction.insert(missionEvents).values([
         { missionId: mission.id, type: "PAYMENT_CAPTURED", missionVersion: nextVersion, data: { paymentOrderId: order.id, providerPaymentId: payment.providerPaymentId, providerOrderId: payment.providerOrderId, amount: order.amount, eventId } },
         { missionId: mission.id, type: "MISSION_PAYMENT_FINALIZED", missionVersion: nextVersion, data: { paymentOrderId: order.id, amount: order.amount, committedAmount: mission.committedAmount + order.amount } },

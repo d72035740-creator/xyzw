@@ -1,5 +1,5 @@
-import { MissionDemo } from "@/components/mission-demo";
+import { ContinuityApp } from "@/components/continuity-app";
 
 export default function Home() {
-  return <MissionDemo />;
+  return <ContinuityApp />;
 }

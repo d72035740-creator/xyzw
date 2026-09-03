@@ -1,8 +1,8 @@
-# MissionPay — Milestone 5
+# MissionPay Continuity
 
-MissionPay's deterministic financial authority core, mock merchant world, proposal planner,
-minimal mission repair, and backend-driven Mission Control demo. This milestone includes no
-Razorpay, settlement, checkout, or committed money.
+MissionPay is a continuity transaction layer for autonomous commerce: AI compiles intent,
+MissionPay bounds authority, live market adapters supply persisted observations, and Razorpay
+Test Mode executes the existing payment flow. Payment and outcome lifecycles remain separate.
 
 ## Local setup
 
@@ -69,8 +69,8 @@ Merchant APIs:
 - `GET /api/merchant/offers/:offerId`
 - `GET /api/merchant/reservations/:reservationId`
 
-The world-change endpoint is available only when both `NODE_ENV=development` and
-`MISSIONPAY_DEMO_MODE=true`:
+The world-change endpoint is available only when the server-side
+`MISSIONPAY_DEMO_MODE=true` flag is present:
 
 - `POST /api/dev/offers/:offerId/simulate-change`
 
@@ -158,3 +158,39 @@ The payment endpoints are `POST /api/missions/:missionId/payment-order`,
 in-process provider; an actual Razorpay checkout requires Test Mode keys and a configured webhook
 URL. Merchant distribution, Route transfers, settlement, refunds, and Milestone 7 are not part
 of this milestone.
+
+## MissionPay Continuity
+
+The primary `/` experience accepts arbitrary commerce outcomes and compiles dynamic `needs[]`;
+the deterministic birthday world remains at `/demo`. Set `MISSIONPAY_MARKET_MODE=live` to use
+SerpAPI Google Shopping, or `sandbox` for synthetic and clearly labelled fallback observations.
+Live mode never falls back silently when `SERPAPI_API_KEY` is absent.
+
+Continuity APIs:
+
+- `POST /api/continuity/missions`
+- `GET /api/continuity/missions/:missionId`
+- `POST /api/continuity/missions/:missionId/replace`
+- `POST /api/continuity/missions/:missionId/revalidate`
+- `POST /api/continuity/missions/:missionId/issues`
+
+Migration `0006_past_fat_cobra.sql` adds persisted market searches and snapshots, dynamic mission
+specification/state, component selections, and an append-only outcome event ledger. External
+offers become financial inputs only after normalization and persistence. For arbitrary internet
+merchants, `AUTHORITY RESERVED` means MissionPay logical financial authority—not merchant inventory.
+
+Required live configuration:
+
+```text
+MISSIONPAY_MARKET_MODE=live
+SERPAPI_API_KEY=
+MISSIONPAY_MARKET_FRESHNESS_SECONDS=60
+MISSIONPAY_PLANNER_PROVIDER=openai
+OPENAI_API_KEY=
+OPENAI_PLANNER_MODEL=
+MISSIONPAY_DEMO_MODE=true
+```
+
+Run `npm run db:migrate`, `npm run db:seed`, then `npm run dev`. Before Vercel deployment, apply
+the migration to the configured Neon database and add the same server-only variables plus the
+existing `DATABASE_URL` and Razorpay Test Mode credentials.

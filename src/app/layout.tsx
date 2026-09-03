@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "MissionPay — Mission Authority",
-  description: "One goal. One authorization. Many merchants.",
+  title: "MissionPay Continuity — Outcome Authority",
+  description: "A continuity transaction layer for autonomous commerce.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
