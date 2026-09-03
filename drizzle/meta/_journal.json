@@ -1,0 +1,48 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1788096914729,
+      "tag": "0000_overjoyed_kate_bishop",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788117653545,
+      "tag": "0001_powerful_orphan",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788284333965,
+      "tag": "0002_wooden_krista_starr",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788286608925,
+      "tag": "0003_lyrical_cerise",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788287861323,
+      "tag": "0004_backfill_reservation_semantics",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788439936271,
+      "tag": "0005_milky_millenium_guard",
+      "breakpoints": true
+    }
+  ]
+}
