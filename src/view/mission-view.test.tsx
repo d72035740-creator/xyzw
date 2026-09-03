@@ -121,9 +121,9 @@ describe("MissionView and demo UI", () => {
     expect(view.timeline.map((event) => event.type)).toEqual(["MISSION_CREATED", "MISSION_READY_TO_COMMIT"]);
   });
 
-  it("keeps demo-only mutation controls disabled outside explicitly enabled development", () => {
-    expect(isDemoMutationEnabled({ NODE_ENV: "production", MISSIONPAY_ENABLE_DEV_WORLD_API: "true" })).toBe(false);
-    expect(isDemoMutationEnabled({ NODE_ENV: "development", MISSIONPAY_ENABLE_DEV_WORLD_API: "false" })).toBe(false);
-    expect(isDemoMutationEnabled({ NODE_ENV: "development", MISSIONPAY_ENABLE_DEV_WORLD_API: "true" })).toBe(true);
+  it("derives demo-only mutation controls from the explicit server demo-mode flag", () => {
+    expect(isDemoMutationEnabled({ MISSIONPAY_DEMO_MODE: "true" })).toBe(true);
+    expect(isDemoMutationEnabled({ MISSIONPAY_DEMO_MODE: "false" })).toBe(false);
+    expect(isDemoMutationEnabled({})).toBe(false);
   });
 });

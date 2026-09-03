@@ -70,7 +70,7 @@ Merchant APIs:
 - `GET /api/merchant/reservations/:reservationId`
 
 The world-change endpoint is available only when both `NODE_ENV=development` and
-`MISSIONPAY_ENABLE_DEV_WORLD_API=true`:
+`MISSIONPAY_DEMO_MODE=true`:
 
 - `POST /api/dev/offers/:offerId/simulate-change`
 
@@ -128,8 +128,9 @@ During active states the client polls every 750 ms; stable and failed states red
 seconds. Mutation buttons lock while a request is in flight, use expected mission/offer versions,
 and never send prices or balances as authority inputs. Payment remains visibly unavailable.
 
-The demo world reset and market-change controls require both development mode and
-`MISSIONPAY_ENABLE_DEV_WORLD_API=true`. The reset endpoint restores only the seeded R1 offer through
+The demo world reset and market-change controls require the server-only
+`MISSIONPAY_DEMO_MODE=true` flag. This works in local development and deployed demo environments;
+when absent, the mutation endpoints return 404. The reset endpoint restores only the seeded R1 offer through
 the economic world-change service; it does not delete missions or bypass invalidation logic:
 
 - `POST /api/dev/demo/reset-world`

@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { POST } from "./route";
 
-describe("development-only offer change API", () => {
-  it("is inaccessible outside NODE_ENV=development even when the feature flag is set", async () => {
-    vi.stubEnv("MISSIONPAY_ENABLE_DEV_WORLD_API", "true");
+describe("demo-mode offer change API", () => {
+  it("is inaccessible in production when demo mode is absent", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("MISSIONPAY_DEMO_MODE", "false");
     const response = await POST(
       new Request("http://localhost/api/dev/offers/test/simulate-change", {
         method: "POST",

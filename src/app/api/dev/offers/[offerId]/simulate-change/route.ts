@@ -2,6 +2,7 @@ import { z } from "zod";
 import { errorResponse } from "@/domain/errors";
 import { mockMerchantAdapter } from "@/commerce/mock-merchant-adapter";
 import { merchantErrorResponse } from "@/commerce/merchant-errors";
+import { isDemoMutationEnabled } from "@/demo/demo-safety";
 
 const changeSchema = z
   .object({
@@ -26,10 +27,7 @@ export async function POST(
   request: Request,
   context: { params: Promise<{ offerId: string }> },
 ): Promise<Response> {
-  if (
-    process.env.NODE_ENV !== "development" ||
-    process.env.MISSIONPAY_ENABLE_DEV_WORLD_API !== "true"
-  ) {
+  if (!isDemoMutationEnabled()) {
     return Response.json({ error: { code: "NOT_FOUND", message: "Not found" } }, { status: 404 });
   }
 
