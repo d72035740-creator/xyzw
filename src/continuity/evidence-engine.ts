@@ -1,0 +1,198 @@
+import { createHash } from "node:crypto";
+import { ContinuityError, type MissionNeed, type MissionSpec } from "./types";
+
+export type EvidenceType = "OFFICIAL_SPEC" | "PROFESSIONAL_REVIEW" | "COMMUNITY" | "COMPARISON" | "MERCHANT";
+export type EvidenceConfidence = "LOW" | "MEDIUM" | "HIGH";
+export type DecisionProfile = "CHEAPEST" | "BEST_VALUE" | "MAX_PERFORMANCE";
+export type PortfolioType = "CHEAPEST_VALID" | "BEST_VALUE" | "MAX_PERFORMANCE";
+
+export type ProductIdentity = { brand?: string; model?: string; modelNumber?: string; size?: string; variant?: string; generation?: string };
+export type EvidenceRecordInput = {
+  missionId: string; needId: string; offerSnapshotId: string; type: EvidenceType; sourceName: string;
+  sourceUrl?: string; title: string; snippet?: string; observedAt: Date; evidenceMode: "SEARCH_EVIDENCE" | "PAGE_EVIDENCE";
+  productIdentityConfidence: EvidenceConfidence; extractedFacts: Record<string, unknown>; sentiment: Record<string, unknown>;
+};
+export type CandidateAssessment = {
+  offerSnapshotId: string; needId: string; title: string; currentPricePaise: number;
+  identity: ProductIdentity; identityConfidence: EvidenceConfidence;
+  hardConstraints: { satisfied: boolean; failures: string[]; unknowns: string[] };
+  scores: { requirementFit: number; productQuality: number; communityReliability: number; evidenceConfidence: number; priceEfficiency: number; utility: number };
+  evidenceCounts: { officialSources: number; professionalSources: number; communityDiscussions: number; merchantSources: number };
+  recurringPositives: string[]; recurringNegatives: string[]; riskFlags: string[];
+};
+export type DecisionPortfolio = {
+  type: PortfolioType; label: string; itemSnapshotIds: string[]; totalPricePaise: number; missionUtility: number;
+  marginalValue: number; tradeOff: string;
+};
+export type DecisionWeights = { requirementFit: number; productQuality: number; communityReliability: number; priceEfficiency: number; evidenceConfidence: number };
+export type DecisionResult = { profile: DecisionProfile; weights: DecisionWeights; evidence: EvidenceRecordInput[]; assessments: CandidateAssessment[]; portfolios: DecisionPortfolio[]; selectedPortfolio: PortfolioType };
+
+export type SnapshotCandidate = {
+  id: string; needId: string; title: string; merchantName: string; sourceUrl: string | null; sourceProvider: string;
+  pricePaise: number; attributes: Record<string, unknown>; evidence: Record<string, unknown> | null;
+};
+
+export type SearchEvidence = { title: string; link?: string; snippet?: string; source?: string };
+
+export class EvidenceSearchConnector {
+  private readonly cache = new Map<string, { expiresAt: number; results: SearchEvidence[] }>();
+  constructor(private readonly apiKey = process.env.SERPAPI_API_KEY ?? "", private readonly fetcher: typeof fetch = fetch) {}
+  async search(query: string): Promise<SearchEvidence[]> {
+    if (!this.apiKey) throw new ContinuityError("EVIDENCE_CONFIGURATION_MISSING", "SERPAPI_API_KEY is required for live evidence research", 503);
+    const cached = this.cache.get(query);
+    if (cached && cached.expiresAt > Date.now()) return cached.results;
+    const url = new URL("https://serpapi.com/search.json");
+    url.searchParams.set("engine", "google"); url.searchParams.set("q", query); url.searchParams.set("gl", "in"); url.searchParams.set("hl", "en"); url.searchParams.set("num", "5"); url.searchParams.set("api_key", this.apiKey);
+    const response = await this.fetcher(url, { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) throw new ContinuityError("EVIDENCE_SEARCH_FAILED", "Evidence search failed", 502, { providerStatus: response.status });
+    const body = await response.json() as { organic_results?: SearchEvidence[] };
+    const results = (body.organic_results ?? []).filter((result) => result.title).slice(0, 5);
+    const ttlMs = /official specifications/i.test(query) ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    if (this.cache.size >= 500) this.cache.delete(this.cache.keys().next().value!);
+    this.cache.set(query, { expiresAt: Date.now() + ttlMs, results });
+    return results;
+  }
+}
+
+const clamp = (value: number) => Math.max(0, Math.min(100, Math.round(value)));
+const modelPattern = /\b\d{2,}[A-Z][A-Z0-9-]*\b/i;
+const sizePattern = /\b\d{2,3}(?:\.\d+)?\s*(?:inch|inches|\")\b/i;
+const stopBrands = new Set(["the", "new", "gaming", "wireless", "mechanical", "ergonomic"]);
+
+export function productIdentity(title: string): ProductIdentity {
+  const words = title.trim().split(/\s+/);
+  const brand = words.find((word) => /^[a-z][a-z0-9-]+$/i.test(word) && !stopBrands.has(word.toLowerCase()));
+  const modelNumber = title.match(modelPattern)?.[0]?.replaceAll(" ", "");
+  return { brand, model: modelNumber, modelNumber, size: title.match(sizePattern)?.[0], variant: title.match(/\b(?:Pro|Max|Plus|Mini)\b/i)?.[0], generation: title.match(/\b(?:Gen(?:eration)?\s*\d+|\d+(?:st|nd|rd|th)\s+Gen(?:eration)?)\b/i)?.[0] };
+}
+
+function identityConfidence(identity: ProductIdentity, evidenceTitle: string): EvidenceConfidence {
+  if (identity.modelNumber && evidenceTitle.replaceAll(" ", "").toLowerCase().includes(identity.modelNumber.toLowerCase())) return "HIGH";
+  if (identity.brand && evidenceTitle.toLowerCase().includes(identity.brand.toLowerCase())) return "MEDIUM";
+  return "LOW";
+}
+
+function sourceHost(link?: string) {
+  try { return link ? new URL(link).hostname.replace(/^www\./, "") : "search-result"; } catch { return "search-result"; }
+}
+
+function evidenceTypeFor(requested: EvidenceType, identity: ProductIdentity, link?: string): EvidenceType {
+  const host = sourceHost(link).toLowerCase();
+  if (requested === "OFFICIAL_SPEC") {
+    const brand = identity.brand?.toLowerCase().replace(/[^a-z0-9]/g, "");
+    return brand && host.replace(/[^a-z0-9]/g, "").includes(brand) ? "OFFICIAL_SPEC" : "PROFESSIONAL_REVIEW";
+  }
+  if (requested === "COMMUNITY" && !host.includes("reddit.com")) return "PROFESSIONAL_REVIEW";
+  return requested;
+}
+
+export function inferDecisionProfile(goal: string): { profile: DecisionProfile; weights: DecisionWeights } {
+  if (/\b(?:cheapest|lowest price|most affordable)\b/i.test(goal)) return { profile: "CHEAPEST", weights: { requirementFit: .3, productQuality: .15, communityReliability: .05, priceEfficiency: .45, evidenceConfidence: .05 } };
+  if (/\b(?:max(?:imum)? performance|best performance|highest performance)\b/i.test(goal)) return { profile: "MAX_PERFORMANCE", weights: { requirementFit: .3, productQuality: .4, communityReliability: .1, priceEfficiency: .05, evidenceConfidence: .15 } };
+  if (/\b(?:reliable|reliability)\b/i.test(goal)) return { profile: "BEST_VALUE", weights: { requirementFit: .25, productQuality: .2, communityReliability: .3, priceEfficiency: .1, evidenceConfidence: .15 } };
+  if (/\b(?:best reviewed|reviews?)\b/i.test(goal)) return { profile: "BEST_VALUE", weights: { requirementFit: .25, productQuality: .2, communityReliability: .15, priceEfficiency: .1, evidenceConfidence: .3 } };
+  return { profile: "BEST_VALUE", weights: { requirementFit: .3, productQuality: .25, communityReliability: .15, priceEfficiency: .15, evidenceConfidence: .15 } };
+}
+
+function hardConstraints(need: MissionNeed, candidate: SnapshotCandidate) {
+  const failures: string[] = []; const unknowns: string[] = [];
+  for (const [key, expected] of Object.entries(need.requiredAttributes)) {
+    const actual = candidate.attributes[key];
+    if (actual === undefined || actual === null) unknowns.push(key);
+    else if (typeof expected === "number" ? typeof actual !== "number" || actual < expected : actual !== expected) failures.push(key);
+  }
+  return { satisfied: failures.length === 0 && unknowns.length === 0, failures, unknowns };
+}
+
+const positiveThemes = [/motion clarity/i, /build quality/i, /battery life/i, /comfortable/i, /reliable/i, /easy setup/i, /good value/i];
+const negativeThemes = [/backlight bleed/i, /weak stand/i, /ghosting/i, /battery issue/i, /software issue/i, /disconnect/i, /poor support/i, /noisy/i];
+function themes(records: EvidenceRecordInput[], patterns: RegExp[]) {
+  return patterns.filter((pattern) => records.filter((record) => pattern.test(`${record.title} ${record.snippet ?? ""}`)).length >= 2).map((pattern) => pattern.source.replace(/\\b|\\/g, "").replace(/\/i$/, ""));
+}
+
+function combinations<T>(groups: T[][], limit = 625): T[][] {
+  let result: T[][] = [[]];
+  for (const group of groups) result = result.flatMap((prefix) => group.map((item) => [...prefix, item])).slice(0, limit);
+  return result;
+}
+
+export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise: number): DecisionPortfolio[] {
+  if (groups.some((group) => !group.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "Every required need needs at least one evidence-qualified candidate", 409);
+  const feasible = combinations(groups.map((group) => group.slice(0, 5))).map((items) => ({ items, total: items.reduce((sum, item) => sum + item.currentPricePaise, 0), utility: items.reduce((sum, item) => sum + item.scores.utility, 0) / items.length })).filter((portfolio) => portfolio.total <= budgetPaise);
+  if (!feasible.length) throw new ContinuityError("BUDGET_EXCEEDED", "No complete evidence-qualified portfolio fits inside authority", 409);
+  const cheapest = [...feasible].sort((a, b) => a.total - b.total || b.utility - a.utility)[0];
+  const performance = [...feasible].sort((a, b) => b.utility - a.utility || a.total - b.total)[0];
+  const bestValue = [...feasible].sort((a, b) => {
+    const aGain = Math.max(0, a.utility - cheapest.utility), bGain = Math.max(0, b.utility - cheapest.utility);
+    const aExtra = Math.max(1, a.total - cheapest.total), bExtra = Math.max(1, b.total - cheapest.total);
+    return (b.utility + 12 * bGain / bExtra * 100000) - (a.utility + 12 * aGain / aExtra * 100000) || a.total - b.total;
+  })[0];
+  const make = (type: PortfolioType, label: string, value: typeof cheapest, tradeOff: string): DecisionPortfolio => ({ type, label, itemSnapshotIds: value.items.map((item) => item.offerSnapshotId), totalPricePaise: value.total, missionUtility: Math.round(value.utility), marginalValue: Math.round(Math.max(0, value.utility - cheapest.utility) * 100000 / Math.max(1, value.total - cheapest.total) * 100) / 100, tradeOff });
+  return [make("CHEAPEST_VALID", "Cheapest valid", cheapest, "Lowest-priced complete mission satisfying verified hard requirements."), make("BEST_VALUE", "Best value", bestValue, "Strongest marginal quality and evidence gain for the additional spend."), make("MAX_PERFORMANCE", "Max performance", performance, "Highest ranking utility found without exceeding authority.")];
+}
+
+export class EvidenceDecisionEngine {
+  constructor(private readonly connector = new EvidenceSearchConnector()) {}
+
+  async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
+    const { profile, weights } = inferDecisionProfile(spec.goal);
+    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).filter((candidate) => hardConstraints(need, candidate).satisfied).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, 5));
+    if (shortlists.some((shortlist) => !shortlist.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "No candidate satisfies every deterministic hard constraint", 409);
+
+    const evidence: EvidenceRecordInput[] = [];
+    for (const candidate of shortlists.flat()) evidence.push({ missionId, needId: candidate.needId, offerSnapshotId: candidate.id, type: "MERCHANT", sourceName: candidate.merchantName, sourceUrl: candidate.sourceUrl ?? undefined, title: candidate.title, snippet: typeof candidate.evidence?.snippet === "string" ? candidate.evidence.snippet : undefined, observedAt: new Date(), evidenceMode: "SEARCH_EVIDENCE", productIdentityConfidence: "HIGH", extractedFacts: candidate.attributes, sentiment: {} });
+
+    if (live) {
+      const researchJobs: Array<Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => shortlist.slice(0, 3).flatMap((candidate) => {
+        const identity = productIdentity(candidate.title); const identityQuery = [identity.brand, identity.modelNumber, identity.size].filter(Boolean).join(" ") || candidate.title;
+        return ([
+          ["OFFICIAL_SPEC", `${identityQuery} official specifications`],
+          ["PROFESSIONAL_REVIEW", `${identityQuery} review problems long term`],
+          ["COMMUNITY", `site:reddit.com ${identityQuery} review issues`],
+        ] as const).map(async ([type, query]) => ({ candidate, type, results: await this.connector.search(query) }));
+      }));
+      const comparisonJobs: Array<Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => {
+        if (shortlist.length < 2) return [];
+        const [first, second] = shortlist; const firstIdentity = productIdentity(first.title); const secondIdentity = productIdentity(second.title);
+        const firstName = [firstIdentity.brand, firstIdentity.modelNumber, firstIdentity.size].filter(Boolean).join(" ") || first.title;
+        const secondName = [secondIdentity.brand, secondIdentity.modelNumber, secondIdentity.size].filter(Boolean).join(" ") || second.title;
+        return [this.connector.search(`${firstName} vs ${secondName}`).then(results => ({ candidate: first, type: "COMPARISON" as const, results }))];
+      });
+      const settled = await Promise.allSettled([...researchJobs, ...comparisonJobs]);
+      for (const result of settled) {
+        if (result.status !== "fulfilled") continue;
+        const { candidate, type, results } = result.value; const identity = productIdentity(candidate.title);
+        for (const item of results) evidence.push({ missionId, needId: candidate.needId, offerSnapshotId: candidate.id, type: evidenceTypeFor(type, identity, item.link), sourceName: item.source ?? sourceHost(item.link), sourceUrl: item.link, title: item.title, snippet: item.snippet, observedAt: new Date(), evidenceMode: "SEARCH_EVIDENCE", productIdentityConfidence: identityConfidence(identity, item.title), extractedFacts: {}, sentiment: {} });
+      }
+    }
+
+    const assessments: CandidateAssessment[] = [];
+    for (const [needIndex, need] of spec.needs.entries()) {
+      const shortlist = shortlists[needIndex];
+      const preliminary = shortlist.map((candidate) => {
+        const records = evidence.filter((record) => record.offerSnapshotId === candidate.id); const identity = productIdentity(candidate.title);
+        const official = records.filter((record) => record.type === "OFFICIAL_SPEC" && record.productIdentityConfidence !== "LOW").length;
+        const professional = records.filter((record) => record.type === "PROFESSIONAL_REVIEW" && record.productIdentityConfidence !== "LOW").length;
+        const community = records.filter((record) => record.type === "COMMUNITY" && record.productIdentityConfidence !== "LOW").length;
+        const positives = themes(records, positiveThemes), negatives = themes(records, negativeThemes);
+        const confidenceScore = clamp(30 + Math.min(25, official * 10) + Math.min(25, professional * 5) + Math.min(20, community * 2));
+        const quality = clamp(55 + Math.min(20, official * 8) + Math.min(15, professional * 4) + positives.length * 4 - negatives.length * 5);
+        const reliability = clamp(50 + positives.length * 7 - negatives.length * 10 + Math.min(15, community));
+        return { candidate, records, identity, official, professional, community, positives, negatives, confidenceScore, quality, reliability };
+      });
+      const ratios = preliminary.map((entry) => entry.quality / entry.candidate.pricePaise); const maxRatio = Math.max(...ratios);
+      for (const [index, entry] of preliminary.entries()) {
+        const priceEfficiency = clamp(ratios[index] / maxRatio * 100); const requirementFit = 100;
+        const utility = clamp(requirementFit * weights.requirementFit + entry.quality * weights.productQuality + entry.reliability * weights.communityReliability + priceEfficiency * weights.priceEfficiency + entry.confidenceScore * weights.evidenceConfidence);
+        assessments.push({ offerSnapshotId: entry.candidate.id, needId: need.id, title: entry.candidate.title, currentPricePaise: entry.candidate.pricePaise * need.quantity, identity: entry.identity, identityConfidence: entry.confidenceScore >= 75 ? "HIGH" : entry.confidenceScore >= 50 ? "MEDIUM" : "LOW", hardConstraints: hardConstraints(need, entry.candidate), scores: { requirementFit, productQuality: entry.quality, communityReliability: entry.reliability, evidenceConfidence: entry.confidenceScore, priceEfficiency, utility }, evidenceCounts: { officialSources: entry.official, professionalSources: entry.professional, communityDiscussions: entry.community, merchantSources: 1 }, recurringPositives: entry.positives, recurringNegatives: entry.negatives, riskFlags: [...(entry.confidenceScore < 50 ? ["LOW_EVIDENCE_CONFIDENCE"] : []), ...(entry.negatives.length ? ["RECURRING_COMPLAINTS"] : [])] });
+      }
+    }
+    const portfolios = optimizePortfolios(spec.needs.map((need) => assessments.filter((assessment) => assessment.needId === need.id).sort((a, b) => b.scores.utility - a.scores.utility)), spec.budgetPaise);
+    const selectedPortfolio: PortfolioType = profile === "CHEAPEST" ? "CHEAPEST_VALID" : profile === "MAX_PERFORMANCE" ? "MAX_PERFORMANCE" : "BEST_VALUE";
+    return { profile, weights, evidence, assessments, portfolios, selectedPortfolio };
+  }
+}
+
+export function decisionCacheKey(candidate: SnapshotCandidate) {
+  return createHash("sha256").update(JSON.stringify([candidate.sourceProvider, candidate.title, candidate.attributes])).digest("hex");
+}

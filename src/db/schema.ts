@@ -375,6 +375,45 @@ export const continuitySelections = pgTable("continuity_selections", {
   check("continuity_selection_price_positive", sql`${table.reservedPricePaise} > 0`),
 ]);
 
+export const productEvidence = pgTable("product_evidence", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id").notNull(),
+  offerSnapshotId: uuid("offer_snapshot_id").notNull().references(() => marketOfferSnapshots.id),
+  type: text("type").notNull(),
+  sourceName: text("source_name").notNull(),
+  sourceUrl: text("source_url"),
+  title: text("title").notNull(),
+  snippet: text("snippet"),
+  evidenceMode: text("evidence_mode").notNull().default("SEARCH_EVIDENCE"),
+  productIdentityConfidence: text("product_identity_confidence").notNull(),
+  extractedFacts: jsonb("extracted_facts_json").$type<Record<string, unknown>>().notNull().default({}),
+  sentiment: jsonb("sentiment_json").$type<Record<string, unknown>>().notNull().default({}),
+  observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("product_evidence_mission_need_idx").on(table.missionId, table.needId), index("product_evidence_snapshot_idx").on(table.offerSnapshotId)]);
+
+export const candidateAssessments = pgTable("candidate_assessments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  needId: text("need_id").notNull(),
+  offerSnapshotId: uuid("offer_snapshot_id").notNull().references(() => marketOfferSnapshots.id),
+  assessment: jsonb("assessment_json").$type<Record<string, unknown>>().notNull(),
+  utilityScore: integer("utility_score").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("candidate_assessments_snapshot_uidx").on(table.offerSnapshotId), index("candidate_assessments_mission_need_idx").on(table.missionId, table.needId), check("candidate_assessments_utility_range", sql`${table.utilityScore} BETWEEN 0 AND 100`)]);
+
+export const decisionRuns = pgTable("decision_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  profile: text("profile").notNull(),
+  weights: jsonb("weights_json").$type<Record<string, number>>().notNull(),
+  portfolios: jsonb("portfolios_json").$type<Array<Record<string, unknown>>>().notNull(),
+  selectedPortfolio: text("selected_portfolio").notNull(),
+  status: text("status").notNull().default("SUCCEEDED"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("decision_runs_mission_idx").on(table.missionId)]);
+
 export const missionOutcomeEvents = pgTable("mission_outcome_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   missionId: uuid("mission_id").notNull().references(() => missions.id),

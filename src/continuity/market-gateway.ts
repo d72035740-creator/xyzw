@@ -69,7 +69,7 @@ export class SerpApiShoppingConnector implements MarketConnector {
         evidence: { title: item.title, snippet: item.snippet, sourceUrl, locationLabel: context.locationLabel, deliveryText: item.delivery, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN", pricingStatus: "KNOWN" },
         reversibility: { type: "UNKNOWN" },
       }];
-    }).slice(0, 8);
+    }).slice(0, 12);
   }
 
   async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) {

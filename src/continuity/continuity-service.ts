@@ -1,9 +1,10 @@
 import { and, desc, eq, inArray, ne } from "drizzle-orm";
 import { db, type Database } from "@/db/client";
-import { continuityMissions, continuityRepairAttempts, continuityRepairPaymentOrders, continuitySelections, marketOfferSnapshots, marketSearches, missionEvents, missionOutcomeEvents, missionPaymentOrders, missions } from "@/db/schema";
+import { candidateAssessments, continuityMissions, continuityRepairAttempts, continuityRepairPaymentOrders, continuitySelections, decisionRuns, marketOfferSnapshots, marketSearches, missionEvents, missionOutcomeEvents, missionPaymentOrders, missions, productEvidence } from "@/db/schema";
 import { MissionCompiler } from "./mission-compiler";
 import { hasKnownPrice, MarketGateway, marketQueryFor } from "./market-gateway";
 import { ContinuityError, missionSpecSchema, type MarketOffer, type MissionLocationInput, type MissionNeed } from "./types";
+import { EvidenceDecisionEngine, type DecisionPortfolio } from "./evidence-engine";
 
 type DbTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 const activeStatuses = ["SELECTED", "PRESERVED"];
@@ -15,7 +16,7 @@ function compareLocationThenPrice(a: { evidence: Record<string, unknown> | null;
 function snapshotValues(missionId:string, offer:MarketOffer & { pricePaise: number }){return{missionId,needId:offer.needId,sourceProvider:offer.source.provider,externalId:offer.source.externalId,sourceUrl:offer.source.url,merchantName:offer.merchant.name,title:offer.title,description:offer.description,pricePaise:offer.pricePaise,currency:offer.currency,availability:offer.availability,attributes:offer.attributes,reversibility:offer.reversibility,evidence:offer.evidence,observedAt:new Date(offer.observedAt),sourceVersion:offer.sourceVersion};}
 
 export class ContinuityService {
-  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler()){}
+  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler(),private readonly decisionEngine=new EvidenceDecisionEngine()){}
   async compile(input:{goal:string;maximumAuthorityPaise?:number;location?:MissionLocationInput|string;repairAllowancePaise?:number}) {
     return this.compiler.compile(input);
   }
@@ -35,13 +36,30 @@ export class ContinuityService {
         marketError ??= group.error;
       }
       if(marketError) throw marketError;
-      return await this.reservePlan(mission.id,spec,offersByNeed);
+      const candidateMap=new Map([...offersByNeed].map(([needId,offers])=>[needId,offers.map(offer=>({id:offer.id,needId:offer.needId,title:offer.title,merchantName:offer.merchantName,sourceUrl:offer.sourceUrl,sourceProvider:offer.sourceProvider,pricePaise:offer.pricePaise,attributes:offer.attributes,evidence:offer.evidence}))]));
+      const decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live");
+      if(decision.evidence.length)await this.database.insert(productEvidence).values(decision.evidence);
+      if(decision.assessments.length)await this.database.insert(candidateAssessments).values(decision.assessments.map(assessment=>({missionId:mission.id,needId:assessment.needId,offerSnapshotId:assessment.offerSnapshotId,assessment,utilityScore:assessment.scores.utility})));
+      await this.database.insert(decisionRuns).values({missionId:mission.id,profile:decision.profile,weights:decision.weights,portfolios:decision.portfolios,selectedPortfolio:decision.selectedPortfolio,status:"SUCCEEDED"});
+      const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
+      return await this.reservePlan(mission.id,spec,offersByNeed,chosen?.itemSnapshotIds);
     }catch(error){await this.database.update(missions).set({status:"INVALIDATED",updatedAt:new Date()}).where(eq(missions.id,mission.id));throw error;}
   }
-  private async reservePlan(missionId:string,spec:ReturnType<typeof missionSpecSchema.parse>,groups:Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>){
-    return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);const selected=spec.needs.map(need=>{const candidates=(groups.get(need.id)??[]).filter(o=>attributesSatisfy(need,o)).sort(compareLocationThenPrice);if(!candidates[0])throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER",`No price-backed offer satisfies ${need.label}`,409,{needId:need.id});return{need,offer:candidates[0]};});const total=selected.reduce((n,x)=>n+x.offer.pricePaise*x.need.quantity,0);if(total>mission.budgetAmount)throw new ContinuityError("BUDGET_EXCEEDED","Live mission exceeds maximum authority",409,{budgetPaise:mission.budgetAmount,informationalTotal:total});await tx.update(missions).set({status:"RESERVING",updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(continuitySelections).values(selected.map(x=>({missionId,needId:x.need.id,snapshotId:x.offer.id,reservedPricePaise:x.offer.pricePaise*x.need.quantity,status:"SELECTED"})));const version=mission.version+1;await tx.update(missions).set({status:"READY_TO_COMMIT",reservedAmount:total,version,updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(missionEvents).values([{missionId,type:"CONTINUITY_AUTHORITY_RESERVED",missionVersion:version,data:{amount:total,components:selected.length,authorityType:"MISSIONPAY_LOGICAL_FINANCIAL_AUTHORITY",locationLabel:spec.location?.label??null}},{missionId,type:"MISSION_READY_TO_COMMIT",missionVersion:version,data:{reservedAmount:total}}]);return this.get(missionId,tx);});
+  private async reservePlan(missionId:string,spec:ReturnType<typeof missionSpecSchema.parse>,groups:Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>,selectedSnapshotIds:string[]=[]){
+    const preferred=new Set(selectedSnapshotIds);
+    return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);const selected=spec.needs.map(need=>{const candidates=(groups.get(need.id)??[]).filter(o=>attributesSatisfy(need,o)).sort((a,b)=>Number(preferred.has(b.id))-Number(preferred.has(a.id))||compareLocationThenPrice(a,b));if(!candidates[0])throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER",`No price-backed offer satisfies ${need.label}`,409,{needId:need.id});return{need,offer:candidates[0]};});const total=selected.reduce((n,x)=>n+x.offer.pricePaise*x.need.quantity,0);if(total>mission.budgetAmount)throw new ContinuityError("BUDGET_EXCEEDED","Live mission exceeds maximum authority",409,{budgetPaise:mission.budgetAmount,informationalTotal:total});await tx.update(missions).set({status:"RESERVING",updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(continuitySelections).values(selected.map(x=>({missionId,needId:x.need.id,snapshotId:x.offer.id,reservedPricePaise:x.offer.pricePaise*x.need.quantity,status:"SELECTED"})));const version=mission.version+1;await tx.update(missions).set({status:"READY_TO_COMMIT",reservedAmount:total,version,updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(missionEvents).values([{missionId,type:"CONTINUITY_AUTHORITY_RESERVED",missionVersion:version,data:{amount:total,components:selected.length,authorityType:"MISSIONPAY_LOGICAL_FINANCIAL_AUTHORITY",locationLabel:spec.location?.label??null}},{missionId,type:"MISSION_READY_TO_COMMIT",missionVersion:version,data:{reservedAmount:total,optimization:"EVIDENCE_DECISION_ENGINE"}}]);return this.get(missionId,tx);});
   }
-  async get(missionId:string,database:Database|DbTransaction=this.database){const [mission]=await database.select().from(missions).where(eq(missions.id,missionId));if(!mission)return null;const [continuity]=await database.select().from(continuityMissions).where(eq(continuityMissions.missionId,missionId));if(!continuity)return null;const spec=missionSpecSchema.parse(continuity.spec);const selections=await database.select({id:continuitySelections.id,needId:continuitySelections.needId,status:continuitySelections.status,reservedPricePaise:continuitySelections.reservedPricePaise,snapshotId:marketOfferSnapshots.id,title:marketOfferSnapshots.title,merchantName:marketOfferSnapshots.merchantName,sourceProvider:marketOfferSnapshots.sourceProvider,externalId:marketOfferSnapshots.externalId,sourceUrl:marketOfferSnapshots.sourceUrl,pricePaise:marketOfferSnapshots.pricePaise,availability:marketOfferSnapshots.availability,attributes:marketOfferSnapshots.attributes,evidence:marketOfferSnapshots.evidence,observedAt:marketOfferSnapshots.observedAt,sourceVersion:marketOfferSnapshots.sourceVersion}).from(continuitySelections).innerJoin(marketOfferSnapshots,eq(continuitySelections.snapshotId,marketOfferSnapshots.id)).where(eq(continuitySelections.missionId,missionId)).orderBy(continuitySelections.createdAt);const events=await database.select().from(missionOutcomeEvents).where(eq(missionOutcomeEvents.missionId,missionId)).orderBy(missionOutcomeEvents.createdAt);return{mission:{id:mission.id,goal:mission.goal,status:mission.status,version:mission.version,budgetPaise:mission.budgetAmount,reservedPaise:mission.reservedAmount,committedPaise:mission.committedAmount,remainingPaise:mission.budgetAmount-mission.reservedAmount-mission.committedAmount},spec,marketMode:continuity.marketMode,outcomeStatus:continuity.outcomeStatus,repairAllowancePaise:continuity.repairAllowancePaise,selections,events};}
+  async get(missionId:string,database:Database|DbTransaction=this.database){
+    const [mission]=await database.select().from(missions).where(eq(missions.id,missionId));if(!mission)return null;
+    const [continuity]=await database.select().from(continuityMissions).where(eq(continuityMissions.missionId,missionId));if(!continuity)return null;
+    const spec=missionSpecSchema.parse(continuity.spec);
+    const selections=await database.select({id:continuitySelections.id,needId:continuitySelections.needId,status:continuitySelections.status,reservedPricePaise:continuitySelections.reservedPricePaise,snapshotId:marketOfferSnapshots.id,title:marketOfferSnapshots.title,merchantName:marketOfferSnapshots.merchantName,sourceProvider:marketOfferSnapshots.sourceProvider,externalId:marketOfferSnapshots.externalId,sourceUrl:marketOfferSnapshots.sourceUrl,pricePaise:marketOfferSnapshots.pricePaise,availability:marketOfferSnapshots.availability,attributes:marketOfferSnapshots.attributes,evidence:marketOfferSnapshots.evidence,observedAt:marketOfferSnapshots.observedAt,sourceVersion:marketOfferSnapshots.sourceVersion}).from(continuitySelections).innerJoin(marketOfferSnapshots,eq(continuitySelections.snapshotId,marketOfferSnapshots.id)).where(eq(continuitySelections.missionId,missionId)).orderBy(continuitySelections.createdAt);
+    const events=await database.select().from(missionOutcomeEvents).where(eq(missionOutcomeEvents.missionId,missionId)).orderBy(missionOutcomeEvents.createdAt);
+    const [decision]=await database.select().from(decisionRuns).where(eq(decisionRuns.missionId,missionId)).orderBy(desc(decisionRuns.createdAt)).limit(1);
+    const assessments=decision?await database.select().from(candidateAssessments).where(eq(candidateAssessments.missionId,missionId)):[];
+    const evidence=decision?await database.select({id:productEvidence.id,offerSnapshotId:productEvidence.offerSnapshotId,type:productEvidence.type,sourceName:productEvidence.sourceName,sourceUrl:productEvidence.sourceUrl,title:productEvidence.title,snippet:productEvidence.snippet,evidenceMode:productEvidence.evidenceMode,productIdentityConfidence:productEvidence.productIdentityConfidence,observedAt:productEvidence.observedAt}).from(productEvidence).where(eq(productEvidence.missionId,missionId)):[];
+    return{mission:{id:mission.id,goal:mission.goal,status:mission.status,version:mission.version,budgetPaise:mission.budgetAmount,reservedPaise:mission.reservedAmount,committedPaise:mission.committedAmount,remainingPaise:mission.budgetAmount-mission.reservedAmount-mission.committedAmount},spec,marketMode:continuity.marketMode,outcomeStatus:continuity.outcomeStatus,repairAllowancePaise:continuity.repairAllowancePaise,selections,events,decision:decision?{profile:decision.profile,weights:decision.weights,portfolios:decision.portfolios as unknown as DecisionPortfolio[],selectedPortfolio:decision.selectedPortfolio}:null,assessments:assessments.map(row=>row.assessment),evidence};
+  }
   async getWithRepairs(missionId: string, database: Database | DbTransaction = this.database) {
     const view = await this.get(missionId, database);
     if (!view) return null;
@@ -52,6 +70,34 @@ export class ContinuityService {
     return { ...view, repairs, payments: { original: originalPayments, repairs: repairPayments } };
   }
 
+  async selectPortfolio(missionId: string, type: DecisionPortfolio["type"], expectedVersion: number) {
+    await this.database.transaction(async transaction => {
+      const [mission] = await transaction.select().from(missions).where(eq(missions.id, missionId)).for("update");
+      if (!mission) throw new ContinuityError("MISSION_NOT_FOUND", "Mission not found", 404);
+      if (mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409);
+      if (mission.status !== "READY_TO_COMMIT") throw new ContinuityError("PORTFOLIO_CHANGE_NOT_ALLOWED", "Portfolio can change only before payment begins", 409);
+      const [decision] = await transaction.select().from(decisionRuns).where(eq(decisionRuns.missionId, missionId)).orderBy(desc(decisionRuns.createdAt)).limit(1).for("update");
+      if (!decision) throw new ContinuityError("DECISION_NOT_FOUND", "Mission decision run was not found", 404);
+      if (decision.selectedPortfolio === type) return;
+      const portfolio = (decision.portfolios as unknown as DecisionPortfolio[]).find(candidate => candidate.type === type);
+      if (!portfolio) throw new ContinuityError("INVALID_PORTFOLIO", "Requested portfolio is unavailable", 409);
+      const snapshots = await transaction.select().from(marketOfferSnapshots).where(and(eq(marketOfferSnapshots.missionId, missionId), inArray(marketOfferSnapshots.id, portfolio.itemSnapshotIds)));
+      const [continuity] = await transaction.select().from(continuityMissions).where(eq(continuityMissions.missionId, missionId));
+      if (!continuity) throw new ContinuityError("MISSION_NOT_FOUND", "Continuity mission not found", 404);
+      const spec = missionSpecSchema.parse(continuity.spec);
+      if (snapshots.length !== spec.needs.length || new Set(snapshots.map(snapshot => snapshot.needId)).size !== spec.needs.length) throw new ContinuityError("INVALID_PORTFOLIO", "Portfolio does not satisfy every required need", 409);
+      const total = snapshots.reduce((sum, snapshot) => sum + snapshot.pricePaise * (spec.needs.find(need => need.id === snapshot.needId)?.quantity ?? 1), 0);
+      if (total > mission.budgetAmount) throw new ContinuityError("BUDGET_EXCEEDED", "Portfolio exceeds mission authority", 409);
+      await transaction.update(continuitySelections).set({ status: "REPLACED", updatedAt: new Date() }).where(and(eq(continuitySelections.missionId, missionId), eq(continuitySelections.status, "SELECTED")));
+      await transaction.insert(continuitySelections).values(snapshots.map(snapshot => ({ missionId, needId: snapshot.needId, snapshotId: snapshot.id, reservedPricePaise: snapshot.pricePaise * (spec.needs.find(need => need.id === snapshot.needId)?.quantity ?? 1), status: "SELECTED" })));
+      const version = mission.version + 1;
+      await transaction.update(missions).set({ reservedAmount: total, version, updatedAt: new Date() }).where(eq(missions.id, missionId));
+      await transaction.update(decisionRuns).set({ selectedPortfolio: type }).where(eq(decisionRuns.id, decision.id));
+      await transaction.insert(missionEvents).values({ missionId, type: "MISSION_PORTFOLIO_SELECTED", missionVersion: version, data: { portfolio: type, reservedAmount: total } });
+    });
+    return this.getWithRepairs(missionId);
+  }
+
   async replace(missionId:string,needId:string,expectedVersion:number){return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);if(mission.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission version is stale",409);if(!["READY_TO_COMMIT","PAID"].includes(mission.status))throw new ContinuityError("REPAIR_NOT_ALLOWED","Mission is not repairable in its current state",409);const [current]=await tx.select().from(continuitySelections).where(and(eq(continuitySelections.missionId,missionId),eq(continuitySelections.needId,needId),inArray(continuitySelections.status,[...activeStatuses,"DEGRADED"]))).for("update");if(!current)throw new ContinuityError("NEED_NOT_SELECTED","Selected need not found",404);const [alternative]=await tx.select().from(marketOfferSnapshots).where(and(eq(marketOfferSnapshots.missionId,missionId),eq(marketOfferSnapshots.needId,needId),ne(marketOfferSnapshots.id,current.snapshotId))).orderBy(marketOfferSnapshots.pricePaise).limit(1);if(!alternative)throw new ContinuityError("NO_REPLACEMENT","No alternate observed offer is available",409);const [continuity]=await tx.select().from(continuityMissions).where(eq(continuityMissions.missionId,missionId));const delta=alternative.pricePaise-current.reservedPricePaise;if(mission.status==="PAID"&&delta>0){const outcomeStatus=continuity.allowAutomaticSubstitution&&delta<=continuity.repairAllowancePaise?"REPAIR_PAYMENT_REQUIRED":"HUMAN_REAUTH_REQUIRED";await tx.update(continuityMissions).set({outcomeStatus,updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionOutcomeEvents).values({missionId,needId,type:"CONTINUITY_REPAIR_PROPOSED",data:{oldPricePaise:current.reservedPricePaise,newPricePaise:alternative.pricePaise,additionalSpendPaise:delta,withinRepairAuthority:delta<=continuity.repairAllowancePaise}});return this.get(missionId,tx);}const nextReserved=mission.status==="PAID"?mission.reservedAmount:mission.reservedAmount-current.reservedPricePaise+alternative.pricePaise;if(nextReserved+mission.committedAmount>mission.budgetAmount)throw new ContinuityError("HUMAN_REAUTH_REQUIRED","Replacement exceeds initial authority",409,{additionalAuthorityPaise:nextReserved+mission.committedAmount-mission.budgetAmount});await tx.update(continuitySelections).set({status:"REPLACED",updatedAt:new Date()}).where(eq(continuitySelections.id,current.id));await tx.insert(continuitySelections).values({missionId,needId,snapshotId:alternative.id,status:"SELECTED",reservedPricePaise:alternative.pricePaise,replacedSelectionId:current.id});const version=mission.version+1;await tx.update(missions).set({reservedAmount:nextReserved,version,updatedAt:new Date()}).where(eq(missions.id,missionId));if(mission.status==="PAID")await tx.update(continuityMissions).set({outcomeStatus:"ACTIVE",updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionEvents).values({missionId,type:"MINIMAL_LIVE_REPAIR_COMPLETED",missionVersion:version,data:{needId,preservedCount:missionSpecSchema.parse(continuity.spec).needs.length-1,oldPricePaise:current.reservedPricePaise,newPricePaise:alternative.pricePaise,refundRequiredPaise:Math.max(0,-delta)}});return this.get(missionId,tx);});}
   async replaceFresh(missionId: string, needId: string, expectedVersion: number) {
     const before = await this.get(missionId);
@@ -59,6 +105,8 @@ export class ContinuityService {
     if (before.mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409);
     const need = before.spec.needs.find((candidate) => candidate.id === needId);
     if (!need) throw new ContinuityError("NEED_NOT_SELECTED", "Mission need not found", 404);
+    const priorAssessments = await this.database.select({ offerSnapshotId: candidateAssessments.offerSnapshotId, utilityScore: candidateAssessments.utilityScore }).from(candidateAssessments).where(and(eq(candidateAssessments.missionId, missionId), eq(candidateAssessments.needId, needId)));
+    const candidateUtilities = new Map(priorAssessments.map(assessment => [assessment.offerSnapshotId, assessment.utilityScore]));
 
     let freshSnapshotIds: string[] | null = null;
     if (before.marketMode === "live") {
@@ -69,6 +117,12 @@ export class ContinuityService {
       await this.database.insert(marketSearches).values({ missionId, needId, connectorId: result.connectorId ?? "unsupported", query: marketQueryFor(need, context), status: pricedOffers.length ? "SUCCEEDED" : "PARTIAL", resultCount: result.offers.length, errorCode: result.error?.code ?? null });
       if (!pricedOffers.length) throw result.error ?? new ContinuityError("NO_REPLACEMENT", "Fresh live search returned no selectable replacement", 409);
       const saved = await this.database.insert(marketOfferSnapshots).values(pricedOffers.map((offer) => snapshotValues(missionId, offer))).returning();
+      const replacementSpec = { ...before.spec, needs: [need], outcome: { ...before.spec.outcome, requiredNeedIds: [need.id] } };
+      const replacementCandidates = new Map([[need.id, saved.map(offer => ({ id: offer.id, needId: offer.needId, title: offer.title, merchantName: offer.merchantName, sourceUrl: offer.sourceUrl, sourceProvider: offer.sourceProvider, pricePaise: offer.pricePaise, attributes: offer.attributes, evidence: offer.evidence }))]]);
+      const replacementDecision = await this.decisionEngine.decide(missionId, replacementSpec, replacementCandidates, true);
+      if (replacementDecision.evidence.length) await this.database.insert(productEvidence).values(replacementDecision.evidence);
+      if (replacementDecision.assessments.length) await this.database.insert(candidateAssessments).values(replacementDecision.assessments.map(assessment => ({ missionId, needId, offerSnapshotId: assessment.offerSnapshotId, assessment, utilityScore: assessment.scores.utility })));
+      for (const assessment of replacementDecision.assessments) candidateUtilities.set(assessment.offerSnapshotId, assessment.scores.utility);
       const rejectedExternalIds = new Set(before.selections.filter((selection) => selection.needId === needId).map((selection) => selection.externalId).filter((value): value is string => Boolean(value)));
       freshSnapshotIds = saved.filter((snapshot) => attributesSatisfy(need, snapshot) && (!snapshot.externalId || !rejectedExternalIds.has(snapshot.externalId))).map((snapshot) => snapshot.id);
       if (!freshSnapshotIds.length) throw new ContinuityError("NO_REPLACEMENT", "Fresh live search found no different offer satisfying this need", 409);
@@ -84,7 +138,7 @@ export class ContinuityService {
       const candidates = freshSnapshotIds
         ? await transaction.select().from(marketOfferSnapshots).where(and(eq(marketOfferSnapshots.missionId, missionId), eq(marketOfferSnapshots.needId, needId), inArray(marketOfferSnapshots.id, freshSnapshotIds))).orderBy(marketOfferSnapshots.pricePaise)
         : await transaction.select().from(marketOfferSnapshots).where(and(eq(marketOfferSnapshots.missionId, missionId), eq(marketOfferSnapshots.needId, needId), ne(marketOfferSnapshots.id, current.snapshotId))).orderBy(marketOfferSnapshots.pricePaise);
-      const alternative = candidates.filter((candidate) => attributesSatisfy(need, candidate)).sort(compareLocationThenPrice)[0];
+      const alternative = candidates.filter((candidate) => attributesSatisfy(need, candidate)).sort((a,b)=>(candidateUtilities.get(b.id)??0)-(candidateUtilities.get(a.id)??0)||compareLocationThenPrice(a,b))[0];
       if (!alternative) throw new ContinuityError("NO_REPLACEMENT", "No different offer satisfies this need", 409);
       const [continuity] = await transaction.select().from(continuityMissions).where(eq(continuityMissions.missionId, missionId));
       if (!continuity) throw new ContinuityError("MISSION_NOT_FOUND", "Continuity mission not found", 404);

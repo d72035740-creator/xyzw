@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { db, sqlClient } from "@/db/client";
@@ -12,7 +13,7 @@ class RepairPaymentProvider implements PaymentProvider {
   readonly publicKeyId = "rzp_test_repair";
   payments = new Map<string, ProviderPayment>();
   calls = 0;
-  async createOrder(input: { amount: number; currency: string }) { return { providerOrderId: `repair_order_${++this.calls}`, amount: input.amount, currency: input.currency }; }
+  async createOrder(input: { amount: number; currency: string }) { return { providerOrderId: `repair_order_${randomUUID()}_${++this.calls}`, amount: input.amount, currency: input.currency }; }
   async fetchPayment(paymentId: string) { return this.payments.get(paymentId) ?? { providerPaymentId: paymentId, providerOrderId: "missing", status: "created", amount: 0, currency: "INR" }; }
   async fetchOrder(orderId: string) { return { providerOrderId: orderId, status: "created" }; }
   verifyCheckoutSignature(input: { signature: string }) { return input.signature === "valid"; }
@@ -31,6 +32,9 @@ afterEach(async () => {
     await transaction`delete from mission_payment_orders where mission_id=${id}`;
     await transaction`delete from mission_outcome_events where mission_id=${id}`;
     await transaction`delete from continuity_selections where mission_id=${id}`;
+    await transaction`delete from product_evidence where mission_id=${id}`;
+    await transaction`delete from candidate_assessments where mission_id=${id}`;
+    await transaction`delete from decision_runs where mission_id=${id}`;
     await transaction`delete from market_offer_snapshots where mission_id=${id}`;
     await transaction`delete from market_searches where mission_id=${id}`;
     await transaction`delete from continuity_missions where mission_id=${id}`;
@@ -52,10 +56,14 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     expect(built!.spec.needs).toHaveLength(4);
     expect(built!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
     expect(built!.mission.reservedPaise + built!.mission.committedPaise).toBeLessThanOrEqual(5_500_000);
-    const first = built!.selections[0];
-    const repaired = await service.replaceFresh(missionId, first.needId, built!.mission.version);
+    const switched = await service.selectPortfolio(missionId, "CHEAPEST_VALID", built!.mission.version);
+    expect(switched!.decision?.selectedPortfolio).toBe("CHEAPEST_VALID");
+    expect(switched!.mission.version).toBe(built!.mission.version + 1);
+    expect(switched!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
+    const first = switched!.selections.find((selection) => selection.status === "SELECTED")!;
+    const repaired = await service.replaceFresh(missionId, first.needId, switched!.mission.version);
     expect(repaired!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
-    expect(repaired!.selections.filter((selection) => selection.status === "REPLACED")).toHaveLength(1);
+    expect(repaired!.selections.filter((selection) => selection.status === "REPLACED")).toHaveLength(5);
     expect(repaired!.mission.reservedPaise).toBeLessThanOrEqual(5_500_000);
     expect(repaired!.spec.location).toEqual({ source: "manual", label: "Varanasi, Uttar Pradesh" });
     const fresh = await service.revalidate(missionId, repaired!.mission.version);
@@ -72,9 +80,9 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url);
       const query = url.searchParams.get("q") ?? "";
       const call = (calls.get(query) ?? 0) + 1;
-      calls.set(query, call);
+      if (url.searchParams.get("engine") === "google_shopping") calls.set(query, call);
       const affected = /144Hz monitor/i.test(query);
-      const replacementSearch = affected && call >= 2;
+      const replacementSearch = affected && call >= 2 && url.searchParams.get("engine") === "google_shopping";
       return new Response(JSON.stringify({ shopping_results: [
         { product_id: `${query}-primary`, title: query, source: "Live Merchant A", extracted_price: 3000, product_link: `https://example.test/${encodeURIComponent(query)}/primary` },
         { product_id: replacementSearch ? `${query}-fresh-replacement` : `${query}-alternate`, title: query, source: "Live Merchant B", extracted_price: replacementSearch ? 3200 : 3500, product_link: `https://example.test/${encodeURIComponent(query)}/replacement` },
@@ -113,9 +121,10 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     const provider = new RepairPaymentProvider();
     const payments = new ContinuityRepairPaymentService(provider, db);
     const order = await payments.createOrder({ missionId, repairAttemptId: repair!.repairs[0].id, expectedVersion: repair!.mission.version, requestKey: "repair-smoke" });
-    provider.payments.set("repair_payment_1", { providerPaymentId: "repair_payment_1", providerOrderId: order.providerOrderId!, status: "captured", amount: 45_000, currency: "INR" });
-    const firstCapture = await payments.processCheckoutCallback({ paymentId: "repair_payment_1", orderId: order.providerOrderId!, signature: "valid" });
-    const duplicateCapture = await payments.processWebhookCapture(provider.payments.get("repair_payment_1")!, "repair-webhook-duplicate");
+    const paymentId = `repair_payment_${randomUUID()}`;
+    provider.payments.set(paymentId, { providerPaymentId: paymentId, providerOrderId: order.providerOrderId!, status: "captured", amount: 45_000, currency: "INR" });
+    const firstCapture = await payments.processCheckoutCallback({ paymentId, orderId: order.providerOrderId!, signature: "valid" });
+    const duplicateCapture = await payments.processWebhookCapture(provider.payments.get(paymentId)!, "repair-webhook-duplicate");
     expect(firstCapture).toMatchObject({ status: "REPAIR_PAYMENT_CAPTURED", duplicate: false, amount: 45_000 });
     expect(duplicateCapture).toMatchObject({ status: "REPAIR_PAYMENT_CAPTURED", duplicate: true, amount: 45_000 });
     const [savedMission] = await db.select().from(missions).where(eq(missions.id, missionId));
