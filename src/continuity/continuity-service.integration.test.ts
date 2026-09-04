@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { db, sqlClient } from "@/db/client";
-import { continuityRepairAttempts, continuityRepairPaymentAttempts, continuityRepairPaymentOrders, missionOutcomeEvents, missionPaymentOrders, missions } from "@/db/schema";
+import { continuityMissions, continuityRepairAttempts, continuityRepairPaymentAttempts, continuityRepairPaymentOrders, marketOfferSnapshots, missionOutcomeEvents, missionPaymentOrders, missions } from "@/db/schema";
 import { ContinuityRepairPaymentService } from "@/payments/continuity-repair-payment-service";
 import { MissionPaymentService } from "@/payments/mission-payment-service";
+import { PaymentOrderCoordinator } from "@/payments/payment-order-coordinator";
 import type { PaymentProvider, ProviderPayment } from "@/payments/payment-provider";
 import { ContinuityService } from "./continuity-service";
 
@@ -123,6 +124,50 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     expect(revalidated!.mission.reservedPaise).toBe(authoritativePortfolio.totalPricePaise);
     const order = await payments.createOrder({ missionId, expectedVersion: revalidated!.mission.version, requestKey: `after-revalidation-${randomUUID()}` });
     expect(order.amount).toBe(authoritativePortfolio.totalPricePaise);
+  });
+
+  it("automatically revalidates expired live offers before creating the Razorpay order", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
+    vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
+    vi.stubEnv("SERPAPI_API_KEY", "test-only-key");
+    vi.stubEnv("MISSIONPAY_MARKET_FRESHNESS_SECONDS", "180");
+    const service = new ContinuityService(db);
+    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    missionId = built!.mission.id;
+    const active = built!.selections.filter((selection) => selection.status === "SELECTED");
+    await db.update(continuityMissions).set({ marketMode: "live" }).where(eq(continuityMissions.missionId, missionId));
+    await db.update(marketOfferSnapshots).set({ sourceProvider: "serpapi-google-shopping", observedAt: new Date(0) }).where(eq(marketOfferSnapshots.missionId, missionId));
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ shopping_results: active.map((selection) => ({ product_id: selection.externalId, title: selection.title, source: selection.merchantName, extracted_price: selection.pricePaise / 100, product_link: selection.sourceUrl })) }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const provider = new RepairPaymentProvider();
+    const coordinator = new PaymentOrderCoordinator(new MissionPaymentService(provider, db), service);
+    const order = await coordinator.createOrder({ missionId, expectedVersion: built!.mission.version, requestKey: `automatic-revalidation-${randomUUID()}` });
+    expect(order).toMatchObject({ marketRevalidated: true, amount: built!.mission.reservedPaise });
+    expect(provider.calls).toBe(1);
+  });
+
+  it("blocks Razorpay and degrades the affected component when an expired live price changed", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
+    vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
+    vi.stubEnv("SERPAPI_API_KEY", "test-only-key");
+    vi.stubEnv("MISSIONPAY_MARKET_FRESHNESS_SECONDS", "180");
+    const service = new ContinuityService(db);
+    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    missionId = built!.mission.id;
+    const active = built!.selections.filter((selection) => selection.status === "SELECTED");
+    const changedId = active[0].externalId;
+    await db.update(continuityMissions).set({ marketMode: "live" }).where(eq(continuityMissions.missionId, missionId));
+    await db.update(marketOfferSnapshots).set({ sourceProvider: "serpapi-google-shopping", observedAt: new Date(0) }).where(eq(marketOfferSnapshots.missionId, missionId));
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ shopping_results: active.map((selection) => ({ product_id: selection.externalId, title: selection.title, source: selection.merchantName, extracted_price: selection.pricePaise / 100 + (selection.externalId === changedId ? 1 : 0), product_link: selection.sourceUrl })) }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const provider = new RepairPaymentProvider();
+    const coordinator = new PaymentOrderCoordinator(new MissionPaymentService(provider, db), service);
+    await expect(coordinator.createOrder({ missionId, expectedVersion: built!.mission.version, requestKey: `market-change-${randomUUID()}` })).rejects.toMatchObject({ code: "MARKET_CHANGED" });
+    expect(provider.calls).toBe(0);
+    const changed = await service.get(missionId);
+    expect(changed!.outcomeStatus).toBe("DEGRADED");
+    expect(changed!.selections.find((selection) => selection.externalId === changedId)?.status).toBe("DEGRADED");
+    expect(await db.select().from(missionPaymentOrders).where(eq(missionPaymentOrders.missionId, missionId))).toHaveLength(0);
   });
 
   it("captures a separate repair payment exactly once without changing original committed authority", async () => {

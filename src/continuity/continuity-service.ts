@@ -173,6 +173,12 @@ export class ContinuityService {
       await transaction.update(continuitySelections).set({ status: "REPLACED", updatedAt: new Date() }).where(eq(continuitySelections.id, current.id));
       await transaction.insert(continuitySelections).values({ missionId, needId, snapshotId: alternative.id, status: "SELECTED", reservedPricePaise: alternative.pricePaise, replacedSelectionId: current.id });
       await transaction.update(missions).set({ reservedAmount: nextReserved, version, updatedAt: new Date() }).where(eq(missions.id, missionId));
+      await transaction.update(continuityMissions).set({ outcomeStatus: "ACTIVE", updatedAt: new Date() }).where(eq(continuityMissions.missionId, missionId));
+      const [decision] = await transaction.select().from(decisionRuns).where(eq(decisionRuns.missionId, missionId)).orderBy(desc(decisionRuns.createdAt)).limit(1).for("update");
+      if (decision) {
+        const portfolios = (decision.portfolios as unknown as DecisionPortfolio[]).map((portfolio) => portfolio.type === decision.selectedPortfolio ? { ...portfolio, itemSnapshotIds: portfolio.itemSnapshotIds.map((id) => id === current.snapshotId ? alternative.id : id), totalPricePaise: nextReserved } : portfolio);
+        await transaction.update(decisionRuns).set({ portfolios, requiresRevalidation: before.marketMode === "live" }).where(eq(decisionRuns.id, decision.id));
+      }
       await transaction.insert(missionEvents).values({ missionId, type: "MINIMAL_LIVE_REPAIR_COMPLETED", missionVersion: version, data: { needId, preservedCount: before.spec.needs.length - 1, oldPricePaise: current.reservedPricePaise, newPricePaise: alternative.pricePaise, freshMarketSearch: before.marketMode === "live" } });
       return { version, requiresRevalidation: before.marketMode === "live" };
     });
@@ -181,6 +187,71 @@ export class ContinuityService {
   }
 
   async revalidate(missionId:string,expectedVersion:number){const current=await this.get(missionId);if(!current)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);if(current.mission.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission version is stale",409);const gateway=new MarketGateway(current.marketMode as "live"|"sandbox");const selected=current.selections.filter(s=>activeStatuses.includes(s.status));const results=await Promise.allSettled(selected.map(async selection=>{const need=current.spec.needs.find(n=>n.id===selection.needId)!;const offer:MarketOffer={id:selection.snapshotId,needId:selection.needId,source:{provider:selection.sourceProvider,externalId:selection.externalId??undefined,url:selection.sourceUrl??undefined},merchant:{name:selection.merchantName},title:selection.title,pricePaise:selection.pricePaise,currency:"INR",availability:selection.availability as MarketOffer["availability"],observedAt:selection.observedAt.toISOString(),sourceVersion:selection.sourceVersion,attributes:selection.attributes};return{selection,need,offer:await gateway.revalidate(offer,need,{missionId,locationLabel:current.spec.location?.label,latitude:current.spec.location?.latitude,longitude:current.spec.location?.longitude})};}));const uncertain=results.some(r=>r.status==="rejected"||!r.value.offer||!hasKnownPrice(r.value.offer)||r.value.offer.pricePaise!==r.value.selection.pricePaise);if(uncertain){await this.database.transaction(async tx=>{const [m]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!m||m.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission changed during revalidation",409);const version=m.version+1;if(m.status==="PAID"){await tx.update(continuityMissions).set({outcomeStatus:"DEGRADED",updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionOutcomeEvents).values({missionId,type:"LIVE_REVALIDATION_DEGRADED",data:{reason:"REVALIDATION_UNCERTAIN"}});}else{await tx.update(missions).set({status:"INVALIDATED",version,updatedAt:new Date()}).where(eq(missions.id,missionId));}await tx.insert(missionEvents).values({missionId,type:"LIVE_REVALIDATION_FAILED",missionVersion:version,data:{code:"REVALIDATION_UNCERTAIN"}});});throw new ContinuityError("REVALIDATION_UNCERTAIN","One or more exact products could not be confirmed",409);}await this.database.transaction(async tx=>{const [m]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!m||m.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission changed during revalidation",409);for(const result of results){if(result.status!=="fulfilled"||!result.value.offer||!hasKnownPrice(result.value.offer))continue;const [snapshot]=await tx.insert(marketOfferSnapshots).values(snapshotValues(missionId,result.value.offer)).returning();await tx.update(continuitySelections).set({snapshotId:snapshot.id,updatedAt:new Date()}).where(eq(continuitySelections.id,result.value.selection.id));}const version=m.version+1;await tx.update(missions).set({version,updatedAt:new Date()}).where(eq(missions.id,missionId));const [decision]=await tx.select({id:decisionRuns.id}).from(decisionRuns).where(eq(decisionRuns.missionId,missionId)).orderBy(desc(decisionRuns.createdAt)).limit(1).for("update");if(decision)await tx.update(decisionRuns).set({requiresRevalidation:false}).where(eq(decisionRuns.id,decision.id));await tx.insert(missionEvents).values({missionId,type:"LIVE_MARKET_REVALIDATED",missionVersion:version,data:{components:selected.length,locationLabel:current.spec.location?.label??null}});});return this.get(missionId);}
+  async prepareForPayment(missionId: string, expectedVersion: number) {
+    const current = await this.get(missionId);
+    if (!current) return { missionVersion: expectedVersion, marketRevalidated: false };
+    if (current.mission.version !== expectedVersion) return { missionVersion: expectedVersion, marketRevalidated: false };
+    if (current.mission.status !== "READY_TO_COMMIT") throw new ContinuityError("PAYMENT_NOT_ALLOWED", `Mission must be READY_TO_COMMIT, not ${current.mission.status}`, 409);
+    const freshnessSeconds = Number(process.env.MISSIONPAY_MARKET_FRESHNESS_SECONDS ?? 60);
+    const selected = current.selections.filter((selection) => activeStatuses.includes(selection.status));
+    const stale = Boolean(current.decision?.requiresRevalidation) || selected.some((selection) => Date.now() - selection.observedAt.getTime() > freshnessSeconds * 1000);
+    if (!stale) return { missionVersion: expectedVersion, marketRevalidated: false };
+    const revalidated = await this.revalidateForPayment(missionId, expectedVersion);
+    return { missionVersion: revalidated.mission.version, marketRevalidated: true };
+  }
+
+  private async revalidateForPayment(missionId: string, expectedVersion: number) {
+    const current = await this.get(missionId);
+    if (!current) throw new ContinuityError("MISSION_NOT_FOUND", "Mission not found", 404);
+    if (current.mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409);
+    const selected = current.selections.filter((selection) => activeStatuses.includes(selection.status));
+    const gateway = new MarketGateway(current.marketMode as "live" | "sandbox");
+    const results = await Promise.allSettled(selected.map(async (selection) => {
+      const need = current.spec.needs.find((candidate) => candidate.id === selection.needId)!;
+      const offer: MarketOffer = { id: selection.snapshotId, needId: selection.needId, source: { provider: selection.sourceProvider, externalId: selection.externalId ?? undefined, url: selection.sourceUrl ?? undefined }, merchant: { name: selection.merchantName }, title: selection.title, pricePaise: selection.pricePaise, currency: "INR", availability: selection.availability as MarketOffer["availability"], observedAt: selection.observedAt.toISOString(), sourceVersion: selection.sourceVersion, attributes: selection.attributes };
+      return { selection, need, offer: await gateway.revalidate(offer, need, { missionId, locationLabel: current.spec.location?.label, latitude: current.spec.location?.latitude, longitude: current.spec.location?.longitude }).catch(() => null) };
+    }));
+    const uncertain = results.filter((result) => result.status === "rejected" || !result.value.offer || !hasKnownPrice(result.value.offer) || result.value.offer.source.provider !== result.value.selection.sourceProvider || Boolean(result.value.selection.externalId && result.value.offer.source.externalId !== result.value.selection.externalId) || !attributesSatisfy(result.value.need, result.value.offer));
+    const changed = results.filter((result) => result.status === "fulfilled" && result.value.offer && hasKnownPrice(result.value.offer) && result.value.offer.pricePaise !== result.value.selection.pricePaise);
+
+    if (uncertain.length || changed.length) {
+      const affectedSelectionIds = new Set([...uncertain, ...changed].map((result) => result.status === "fulfilled" ? result.value.selection.id : null).filter((id): id is string => Boolean(id)));
+      const affectedNeedIds = [...new Set([...uncertain, ...changed].map((result) => result.status === "fulfilled" ? result.value.selection.needId : null).filter((id): id is string => Boolean(id)))];
+      const potentialTotal = results.reduce((sum, result) => {
+        if (result.status !== "fulfilled" || !result.value.offer || !hasKnownPrice(result.value.offer)) return sum + (result.status === "fulfilled" ? result.value.selection.reservedPricePaise : 0);
+        return sum + result.value.offer.pricePaise * result.value.need.quantity;
+      }, 0);
+      const code = uncertain.length ? "REVALIDATION_UNCERTAIN" : potentialTotal > current.mission.budgetPaise ? "MISSION_OVER_AUTHORITY" : "MARKET_CHANGED";
+      await this.database.transaction(async (transaction) => {
+        const [mission] = await transaction.select().from(missions).where(eq(missions.id, missionId)).for("update");
+        if (!mission || mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission changed during automatic revalidation", 409);
+        for (const result of results) if (result.status === "fulfilled" && result.value.offer && hasKnownPrice(result.value.offer)) await transaction.insert(marketOfferSnapshots).values(snapshotValues(missionId, result.value.offer));
+        if (affectedSelectionIds.size) await transaction.update(continuitySelections).set({ status: "DEGRADED", updatedAt: new Date() }).where(inArray(continuitySelections.id, [...affectedSelectionIds]));
+        await transaction.update(continuityMissions).set({ outcomeStatus: "DEGRADED", updatedAt: new Date() }).where(eq(continuityMissions.missionId, missionId));
+        const version = mission.version + 1;
+        await transaction.update(missions).set({ version, updatedAt: new Date() }).where(eq(missions.id, missionId));
+        await transaction.insert(missionEvents).values({ missionId, type: "LIVE_REVALIDATION_FAILED", missionVersion: version, data: { code, affectedNeedIds, potentialTotalPaise: potentialTotal, budgetPaise: mission.budgetAmount } });
+      });
+      throw new ContinuityError(code, code === "MARKET_CHANGED" ? "Market changed before payment. Repair the affected component." : code === "MISSION_OVER_AUTHORITY" ? "Market changes put the mission over authority." : "One or more exact products could not be confirmed.", 409, { affectedNeedIds, potentialTotalPaise: potentialTotal, budgetPaise: current.mission.budgetPaise });
+    }
+
+    await this.database.transaction(async (transaction) => {
+      const [mission] = await transaction.select().from(missions).where(eq(missions.id, missionId)).for("update");
+      if (!mission || mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission changed during automatic revalidation", 409);
+      for (const result of results) {
+        if (result.status !== "fulfilled" || !result.value.offer || !hasKnownPrice(result.value.offer)) continue;
+        const [snapshot] = await transaction.insert(marketOfferSnapshots).values(snapshotValues(missionId, result.value.offer)).returning();
+        await transaction.update(continuitySelections).set({ snapshotId: snapshot.id, updatedAt: new Date() }).where(eq(continuitySelections.id, result.value.selection.id));
+      }
+      const [decision] = await transaction.select({ id: decisionRuns.id }).from(decisionRuns).where(eq(decisionRuns.missionId, missionId)).orderBy(desc(decisionRuns.createdAt)).limit(1).for("update");
+      if (decision) await transaction.update(decisionRuns).set({ requiresRevalidation: false }).where(eq(decisionRuns.id, decision.id));
+      const version = mission.version + 1;
+      await transaction.update(missions).set({ version, updatedAt: new Date() }).where(eq(missions.id, missionId));
+      await transaction.insert(missionEvents).values({ missionId, type: "LIVE_MARKET_REVALIDATED", missionVersion: version, data: { components: selected.length, automaticBeforePayment: true, locationLabel: current.spec.location?.label ?? null } });
+    });
+    return (await this.get(missionId))!;
+  }
+
   async reportIssue(missionId:string,needId:string,issue:string){return this.database.transaction(async tx=>{const [m]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!m||m.status!=="PAID")throw new ContinuityError("OUTCOME_NOT_ACTIVE","Issues can be reported after payment capture",409);const [selection]=await tx.select().from(continuitySelections).where(and(eq(continuitySelections.missionId,missionId),eq(continuitySelections.needId,needId),inArray(continuitySelections.status,activeStatuses))).for("update");if(!selection)throw new ContinuityError("NEED_NOT_SELECTED","Selected need not found",404);await tx.update(continuitySelections).set({status:"DEGRADED",updatedAt:new Date()}).where(eq(continuitySelections.id,selection.id));await tx.update(continuityMissions).set({outcomeStatus:"DEGRADED",updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionOutcomeEvents).values({missionId,needId,type:"USER_REPORTED_ISSUE",data:{issue,source:"USER"}});return this.get(missionId,tx);});}
 }
 export const continuityService=new ContinuityService();
