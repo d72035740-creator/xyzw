@@ -11,12 +11,13 @@ type Selection = {
 };
 type View = {
   mission: { id: string; goal: string; status: string; version: number; budgetPaise: number; reservedPaise: number; committedPaise: number; remainingPaise: number };
-  spec: { location?: { source: "browser" | "manual" | "prompt"; label: string }; needs: Array<{ id: string; label: string; requiredAttributes: Record<string, unknown>; dependencies: string[] }> };
+  spec: { location?: { source: "browser" | "manual" | "prompt"; label: string }; participants: Array<{ label: string; count?: number; role?: string }>; needs: Array<{ id: string; label: string; kind: string; requiredAttributes: Record<string, unknown>; dependencies: string[] }> };
   marketMode: string; outcomeStatus: string; repairAllowancePaise: number;
   selections: Selection[]; events: Array<{ id: string; type: string; data: Record<string, unknown>; createdAt: string }>;
   repairs?: Array<{ id: string; affectedNeedId: string; replacementSnapshotId: string; replacementTitle: string; replacementMerchant: string; oldPricePaise: number; newPricePaise: number; additionalSpendPaise: number; authorizedAdditionalSpendPaise: number; refundRequiredPaise: number; status: string }>;
   payments?: { original: Array<{ id: string; amount: number; status: string }>; repairs: Array<{ id: string; repairAttemptId: string; amount: number; status: string }> };
 };
+type Understanding = View["spec"] & { goal: string; budgetPaise: number };
 declare global { interface Window { Razorpay?: new(options: Record<string, unknown>) => { open: () => void } } }
 
 const money = (paise: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(paise / 100);
@@ -47,14 +48,21 @@ export function ContinuityApp() {
   const [locationRequested, setLocationRequested] = useState(false);
   const [manualLocationOpen, setManualLocationOpen] = useState(false);
   const [view, setView] = useState<View | null>(null);
+  const [understanding, setUnderstanding] = useState<Understanding | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
   async function run(label: string, work: () => Promise<void>) { setBusy(label); setError(""); try { await work(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Mission failed"); } finally { setBusy(""); } }
   async function refresh(id = view?.mission.id) { if (id) setView(await request<View>(`/api/continuity/missions/${id}`)); }
-  async function build() {
+  function missionInput() {
     const location = manualLocation.trim() || browserLocation ? { manualLabel: manualLocation.trim() || undefined, browser: browserLocation ?? undefined } : undefined;
-    await run("UNDERSTANDING MISSION", async () => setView(await request<View>("/api/continuity/missions", { method: "POST", body: JSON.stringify({ goal, maximumAuthorityPaise: Math.round(Number(authority) * 100), repairAllowancePaise: Math.round(Number(repair) * 100), location }) })));
+    return { goal, maximumAuthorityPaise: Math.round(Number(authority) * 100), repairAllowancePaise: Math.round(Number(repair) * 100), location };
+  }
+  async function understand() {
+    await run("UNDERSTANDING YOUR MISSION", async () => setUnderstanding(await request<Understanding>("/api/continuity/compile", { method: "POST", body: JSON.stringify(missionInput()) })));
+  }
+  async function build() {
+    await run("SEARCHING LOCAL MARKET", async () => setView(await request<View>("/api/continuity/missions", { method: "POST", body: JSON.stringify(missionInput()) })));
   }
   function useCurrentLocation() {
     if (locationRequested) return;
@@ -103,7 +111,7 @@ export function ContinuityApp() {
     });
   }
 
-  if (!view) return <main className="continuity-hero"><nav><b>MISSIONPAY</b><Link href="/demo">SANDBOX DEMO ↗</Link></nav><section><div className="continuity-kicker">CONTINUITY TRANSACTION LAYER</div><h1>Payments authorize purchases.<br /><em>MissionPay authorizes missions.</em></h1><p>Describe the outcome. MissionPay compiles the requirements, observes the market, bounds financial authority, and keeps working after checkout.</p><div className="continuity-form"><label>WHAT DO YOU WANT ACCOMPLISHED?<textarea value={goal} onChange={event => setGoal(event.target.value)} /></label><div className="location-control"><small>LOCATION</small>{manualLocation ? <div><b>📍 {manualLocation}</b><button type="button" onClick={() => setManualLocationOpen(true)}>CHANGE</button></div> : browserLocation ? <div><b>📍 {browserLocation.label}</b><button type="button" onClick={() => setManualLocationOpen(true)}>CHANGE</button></div> : <div><button type="button" onClick={useCurrentLocation} disabled={locationRequested}>{locationStatus === "finding" ? "Finding your location..." : "USE MY CURRENT LOCATION"}</button><button type="button" onClick={() => setManualLocationOpen(true)}>ENTER MANUALLY</button></div>}{locationStatus === "ready" && !manualLocation && <span>Using your current location</span>}{locationStatus === "denied" && <span>Location permission was not granted. Enter a location to get location-aware results.</span>}{locationStatus === "unavailable" && <span>Your location is unavailable. Enter it manually to continue with location-aware results.</span>}{locationStatus === "unsupported" && <span>This browser does not support location. Enter it manually.</span>}{manualLocationOpen && <label>MANUAL LOCATION<input autoFocus value={manualLocation} placeholder="Varanasi, Delhi, Bengaluru, IIT BHU…" onChange={event => setManualLocation(event.target.value)} /></label>}</div><div className="continuity-fields"><label>MAXIMUM AUTHORITY ₹<input type="number" value={authority} onChange={event => setAuthority(event.target.value)} /></label><label>AUTO REPAIR ALLOWANCE ₹<input type="number" value={repair} onChange={event => setRepair(event.target.value)} /></label></div><button onClick={build} disabled={!!busy}>{busy || "BUILD MY MISSION"} <span>→</span></button>{error && <div className="continuity-error">{error}</div>}</div><div className="continuity-trust">AI proposes. <b>MissionPay authorizes.</b> Razorpay executes.</div></section></main>;
+  if (!view) return <main className="continuity-hero"><nav><b>MISSIONPAY</b><Link href="/demo">SANDBOX DEMO ↗</Link></nav><section><div className="continuity-kicker">CONTINUITY TRANSACTION LAYER</div><h1>Payments authorize purchases.<br /><em>MissionPay authorizes missions.</em></h1><p>Describe the outcome. MissionPay compiles the requirements, observes the market, bounds financial authority, and keeps working after checkout.</p><div className="continuity-form"><label>WHAT DO YOU WANT ACCOMPLISHED?<textarea value={goal} onChange={event => { setGoal(event.target.value); setUnderstanding(null); }} /></label><div className="location-control"><small>LOCATION</small>{manualLocation ? <div><b>📍 {manualLocation}</b><button type="button" onClick={() => setManualLocationOpen(true)}>CHANGE</button></div> : browserLocation ? <div><b>📍 {browserLocation.label}</b><button type="button" onClick={() => setManualLocationOpen(true)}>CHANGE</button></div> : <div><button type="button" onClick={useCurrentLocation} disabled={locationRequested}>{locationStatus === "finding" ? "Finding your location..." : "USE MY CURRENT LOCATION"}</button><button type="button" onClick={() => setManualLocationOpen(true)}>ENTER MANUALLY</button></div>}{locationStatus === "ready" && !manualLocation && <span>Using your current location</span>}{locationStatus === "denied" && <span>Location permission was not granted. Enter a location to get location-aware results.</span>}{locationStatus === "unavailable" && <span>Your location is unavailable. Enter it manually to continue with location-aware results.</span>}{locationStatus === "unsupported" && <span>This browser does not support location. Enter it manually.</span>}{manualLocationOpen && <label>MANUAL LOCATION<input autoFocus value={manualLocation} placeholder="Varanasi, Delhi, Bengaluru, IIT BHU…" onChange={event => { setManualLocation(event.target.value); setUnderstanding(null); }} /></label>}</div><div className="continuity-fields"><label>MAXIMUM AUTHORITY ₹<input type="number" value={authority} onChange={event => { setAuthority(event.target.value); setUnderstanding(null); }} /></label><label>AUTO REPAIR ALLOWANCE ₹<input type="number" value={repair} onChange={event => { setRepair(event.target.value); setUnderstanding(null); }} /></label></div>{understanding && <section className="mission-understanding"><small>UNDERSTANDING YOUR MISSION</small><dl><dt>Goal</dt><dd>{understanding.goal}</dd><dt>People</dt><dd>{understanding.participants.length ? understanding.participants.map(participant => participant.count ?? participant.label).join(", ") : "Not specified"}</dd><dt>Location</dt><dd>{understanding.location?.label ?? "Not specified"}</dd><dt>Need</dt><dd>{understanding.needs.map(need => `${need.label} · ${need.kind.replaceAll("_", " ")}`).join(", ")}</dd><dt>Budget</dt><dd>{money(understanding.budgetPaise)}</dd></dl></section>}<button onClick={understanding ? build : understand} disabled={!!busy}>{busy || (understanding ? "SEARCH LOCAL MARKET" : "UNDERSTAND MY MISSION")} <span>→</span></button>{error && <div className="continuity-error">{error}</div>}</div><div className="continuity-trust">AI proposes. <b>MissionPay authorizes.</b> Razorpay executes.</div></section></main>;
 
   const active = view.selections.filter(selection => selection.status !== "REPLACED");
   const paid = view.mission.status === "PAID";
