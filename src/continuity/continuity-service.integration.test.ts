@@ -47,7 +47,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000, location: "India" });
+    const built = await service.build({ goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000, location: { manualLabel: "Varanasi, Uttar Pradesh" } });
     missionId = built!.mission.id;
     expect(built!.spec.needs).toHaveLength(4);
     expect(built!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
@@ -57,8 +57,10 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     expect(repaired!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
     expect(repaired!.selections.filter((selection) => selection.status === "REPLACED")).toHaveLength(1);
     expect(repaired!.mission.reservedPaise).toBeLessThanOrEqual(5_500_000);
+    expect(repaired!.spec.location).toEqual({ source: "manual", label: "Varanasi, Uttar Pradesh" });
     const fresh = await service.revalidate(missionId, repaired!.mission.version);
     expect(fresh!.mission.status).toBe("READY_TO_COMMIT");
+    expect(fresh!.spec.location).toEqual(repaired!.spec.location);
   });
 
   it("performs a fresh live replacement search for only the affected need before whole-mission revalidation", async () => {

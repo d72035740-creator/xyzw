@@ -166,6 +166,12 @@ the deterministic birthday world remains at `/demo`. Set `MISSIONPAY_MARKET_MODE
 SerpAPI Google Shopping, or `sandbox` for synthetic and clearly labelled fallback observations.
 Live mode never falls back silently when `SERPAPI_API_KEY` is absent.
 
+Location is foreground and consent-based. The primary UI requests browser geolocation only after
+the user clicks the location control, reverse-geocodes it to a safe label, and supports manual
+override. An explicit delivery destination in the mission prompt takes precedence. Precise
+coordinates are omitted from client read models and payment notes; unsupported delivery evidence
+is shown as `UNKNOWN` rather than inferred.
+
 Continuity APIs:
 
 - `POST /api/continuity/missions`
