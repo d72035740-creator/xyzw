@@ -50,6 +50,13 @@
       "when": 1788472281972,
       "tag": "0006_past_fat_cobra",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788507525544,
+      "tag": "0007_wild_zombie",
+      "breakpoints": true
     }
   ]
 }

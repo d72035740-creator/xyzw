@@ -173,6 +173,9 @@ Continuity APIs:
 - `POST /api/continuity/missions/:missionId/replace`
 - `POST /api/continuity/missions/:missionId/revalidate`
 - `POST /api/continuity/missions/:missionId/issues`
+- `POST /api/continuity/missions/:missionId/repair-payment-order`
+- `POST /api/continuity/missions/:missionId/repair-payment-callback`
+- `POST /api/continuity/missions/:missionId/repairs/:repairAttemptId/authorize`
 
 Migration `0006_past_fat_cobra.sql` adds persisted market searches and snapshots, dynamic mission
 specification/state, component selections, and an append-only outcome event ledger. External
@@ -194,3 +197,9 @@ MISSIONPAY_DEMO_MODE=true
 Run `npm run db:migrate`, `npm run db:seed`, then `npm run dev`. Before Vercel deployment, apply
 the migration to the configured Neon database and add the same server-only variables plus the
 existing `DATABASE_URL` and Razorpay Test Mode credentials.
+
+Migration `0007_wild_zombie.sql` adds separately linked continuity repair attempts, repair payment
+orders, and repair payment attempts. A positive post-payment replacement delta is paid through a
+new Razorpay Test Mode order; it never reopens or mutates the original captured order. Live
+replacement discovery searches only the affected need, persists the new observations, preserves
+unaffected selections, and then revalidates the resulting mission.

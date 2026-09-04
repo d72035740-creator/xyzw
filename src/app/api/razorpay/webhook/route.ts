@@ -4,6 +4,7 @@ import { razorpayPaymentProvider } from "@/payments/payment.server";
 import { db } from "@/db/client";
 import { razorpayWebhookEvents } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { continuityRepairPaymentService } from "@/payments/continuity-repair-payment.server";
 
 export async function POST(request: Request): Promise<Response> {
   const rawBody = await request.text();
@@ -19,8 +20,14 @@ export async function POST(request: Request): Promise<Response> {
     const entity = payload.payload?.payment?.entity;
     if (entity?.id && entity.order_id && typeof entity.amount === "number" && entity.currency) {
       const payment = { providerPaymentId: entity.id, providerOrderId: entity.order_id, status: entity.status ?? "", amount: entity.amount, currency: entity.currency };
-      if (payload.event === "payment.captured") await missionPaymentService.processWebhookCapture(payment, eventId);
-      else if (payload.event === "payment.failed") await missionPaymentService.processWebhookFailure(payment, eventId);
+      const isRepair = await continuityRepairPaymentService.ownsProviderOrder(payment.providerOrderId);
+      if (payload.event === "payment.captured") {
+        if (isRepair) await continuityRepairPaymentService.processWebhookCapture(payment, eventId);
+        else await missionPaymentService.processWebhookCapture(payment, eventId);
+      } else if (payload.event === "payment.failed") {
+        if (isRepair) await continuityRepairPaymentService.processWebhookFailure(payment, eventId);
+        else await missionPaymentService.processWebhookFailure(payment, eventId);
+      }
     }
     await db.update(razorpayWebhookEvents).set({ processingStatus: payload.event === "payment.authorized" ? "IGNORED" : "PROCESSED", processedAt: new Date() }).where(eq(razorpayWebhookEvents.providerEventId, eventId));
     return Response.json({ acknowledged: true });

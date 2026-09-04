@@ -384,6 +384,61 @@ export const missionOutcomeEvents = pgTable("mission_outcome_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [index("mission_outcome_events_mission_idx").on(table.missionId)]);
 
+export const continuityRepairAttempts = pgTable("continuity_repair_attempts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  affectedNeedId: text("affected_need_id").notNull(),
+  originalSelectionId: uuid("original_selection_id").notNull().references(() => continuitySelections.id),
+  replacementSnapshotId: uuid("replacement_snapshot_id").notNull().references(() => marketOfferSnapshots.id),
+  originalPaymentOrderId: uuid("original_payment_order_id").notNull().references(() => missionPaymentOrders.id),
+  oldPricePaise: integer("old_price_paise").notNull(),
+  newPricePaise: integer("new_price_paise").notNull(),
+  additionalSpendPaise: integer("additional_spend_paise").notNull().default(0),
+  authorizedAdditionalSpendPaise: integer("authorized_additional_spend_paise").notNull().default(0),
+  refundRequiredPaise: integer("refund_required_paise").notNull().default(0),
+  status: text("status").notNull().default("PROPOSED"),
+  ...timestamps,
+}, (table) => [
+  index("continuity_repair_attempts_mission_idx").on(table.missionId),
+  check("continuity_repair_amounts_nonnegative", sql`${table.additionalSpendPaise} >= 0 AND ${table.authorizedAdditionalSpendPaise} >= 0 AND ${table.refundRequiredPaise} >= 0`),
+  check("continuity_repair_prices_positive", sql`${table.oldPricePaise} > 0 AND ${table.newPricePaise} > 0`),
+]);
+
+export const continuityRepairPaymentOrders = pgTable("continuity_repair_payment_orders", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  repairAttemptId: uuid("repair_attempt_id").notNull().references(() => continuityRepairAttempts.id),
+  amount: integer("amount").notNull(),
+  currency: varchar("currency", { length: 3 }).notNull().default("INR"),
+  provider: text("provider").notNull().default("razorpay"),
+  providerOrderId: text("provider_order_id").unique(),
+  idempotencyKey: text("idempotency_key"),
+  status: text("status").notNull().default("ACTIVE"),
+  ...timestamps,
+}, (table) => [
+  index("continuity_repair_payment_orders_mission_idx").on(table.missionId),
+  uniqueIndex("continuity_repair_payment_orders_attempt_uidx").on(table.repairAttemptId),
+  uniqueIndex("continuity_repair_payment_orders_request_uidx").on(table.missionId, table.idempotencyKey),
+  check("continuity_repair_payment_order_amount_positive", sql`${table.amount} > 0`),
+]);
+
+export const continuityRepairPaymentAttempts = pgTable("continuity_repair_payment_attempts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  missionId: uuid("mission_id").notNull().references(() => missions.id),
+  repairPaymentOrderId: uuid("repair_payment_order_id").notNull().references(() => continuityRepairPaymentOrders.id),
+  providerPaymentId: text("provider_payment_id").notNull(),
+  providerOrderId: text("provider_order_id").notNull(),
+  callbackVerified: boolean("callback_verified").notNull().default(false),
+  providerStatus: text("provider_status"),
+  amount: integer("amount").notNull(),
+  status: text("status").notNull().default("RECEIVED"),
+  ...timestamps,
+}, (table) => [
+  index("continuity_repair_payment_attempts_mission_idx").on(table.missionId),
+  uniqueIndex("continuity_repair_payment_attempts_provider_payment_uidx").on(table.providerPaymentId),
+  check("continuity_repair_payment_attempt_amount_positive", sql`${table.amount} > 0`),
+]);
+
 export const missionRelations = relations(missions, ({ many }) => ({
   items: many(missionItems),
   reservations: many(reservations),
