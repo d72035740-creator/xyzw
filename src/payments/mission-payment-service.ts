@@ -2,7 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { db, type Database } from "@/db/client";
 import { assertTransition } from "@/domain/mission-state";
 import { MissionError } from "@/domain/errors";
-import { continuityMissions, continuitySelections, marketOfferSnapshots, merchants, missionEvents, missionItems, missionOutcomeEvents, missionPaymentOrders, missions, offers, paymentAttempts, reservations } from "@/db/schema";
+import { continuityMissions, continuitySelections, decisionRuns, marketOfferSnapshots, merchants, missionEvents, missionItems, missionOutcomeEvents, missionPaymentOrders, missions, offers, paymentAttempts, reservations } from "@/db/schema";
 import { missionSpecSchema } from "@/continuity/types";
 import { PaymentError } from "./payment-errors";
 import type { PaymentProvider, ProviderPayment } from "./payment-provider";
@@ -109,6 +109,8 @@ export class MissionPaymentService {
     const [continuity] = await transaction.select().from(continuityMissions).where(eq(continuityMissions.missionId, mission.id));
     if (continuity) {
       if (continuity.outcomeStatus === "DEGRADED" || continuity.outcomeStatus === "HUMAN_REAUTH_REQUIRED") throw new PaymentError("PAYMENT_NOT_ALLOWED", "Mission outcome has unresolved degradation");
+      const [decision] = await transaction.select().from(decisionRuns).where(eq(decisionRuns.missionId, mission.id)).orderBy(desc(decisionRuns.createdAt)).limit(1);
+      if (decision?.requiresRevalidation) throw new PaymentError("PAYMENT_NOT_ALLOWED", "STALE_MARKET_STATE: revalidate the selected portfolio before payment", 409);
       const selected = await transaction.select({ needId: continuitySelections.needId, amount: continuitySelections.reservedPricePaise, observedAt: marketOfferSnapshots.observedAt })
         .from(continuitySelections).innerJoin(marketOfferSnapshots, eq(continuitySelections.snapshotId, marketOfferSnapshots.id))
         .where(and(eq(continuitySelections.missionId, mission.id), eq(continuitySelections.status, "SELECTED")));
@@ -118,6 +120,10 @@ export class MissionPaymentService {
       if (selected.some((row) => Date.now() - row.observedAt.getTime() > freshnessSeconds * 1000)) throw new PaymentError("PAYMENT_NOT_ALLOWED", "STALE_MARKET_STATE: revalidate live offers before payment", 409);
       const sum = selected.reduce((total, row) => total + row.amount, 0);
       if (sum !== mission.reservedAmount) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Persisted continuity total does not match mission authority");
+      if (decision) {
+        const portfolio = (decision.portfolios as Array<{ type: string; totalPricePaise: number }>).find((candidate) => candidate.type === decision.selectedPortfolio);
+        if (!portfolio || portfolio.totalPricePaise !== sum) throw new PaymentError("PAYMENT_NOT_ALLOWED", "Selected portfolio does not match mission authority");
+      }
       return sum;
     }
     const rows = await transaction.select({ itemId: missionItems.id, required: missionItems.required, reservationId: missionItems.reservationId, reservationStatus: reservations.status, reservedAmount: reservations.amount, offerAmount: offers.amount, offerVersion: offers.version, reservedOfferVersion: reservations.offerVersion, offerReadyAt: offers.readyAt, reservedReadyAt: reservations.readyAt, offerAvailable: offers.available, reservedAvailable: reservations.offerAvailable, offerVegetarian: offers.vegetarian, reservedVegetarian: reservations.offerVegetarian, offerServesPeople: offers.servesPeople, reservedServesPeople: reservations.offerServesPeople, category: merchants.category }).from(missionItems).leftJoin(reservations, eq(missionItems.reservationId, reservations.id)).leftJoin(offers, eq(reservations.offerId, offers.id)).leftJoin(merchants, eq(offers.merchantId, merchants.id)).where(eq(missionItems.missionId, mission.id));

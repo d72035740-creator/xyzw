@@ -410,6 +410,7 @@ export const decisionRuns = pgTable("decision_runs", {
   weights: jsonb("weights_json").$type<Record<string, number>>().notNull(),
   portfolios: jsonb("portfolios_json").$type<Array<Record<string, unknown>>>().notNull(),
   selectedPortfolio: text("selected_portfolio").notNull(),
+  requiresRevalidation: boolean("requires_revalidation").notNull().default(false),
   status: text("status").notNull().default("SUCCEEDED"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [index("decision_runs_mission_idx").on(table.missionId)]);

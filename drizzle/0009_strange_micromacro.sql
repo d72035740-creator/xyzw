@@ -1,0 +1,1 @@
+ALTER TABLE "decision_runs" ADD COLUMN "requires_revalidation" boolean DEFAULT false NOT NULL;

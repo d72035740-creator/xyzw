@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { db, sqlClient } from "@/db/client";
 import { continuityRepairAttempts, continuityRepairPaymentAttempts, continuityRepairPaymentOrders, missionOutcomeEvents, missionPaymentOrders, missions } from "@/db/schema";
 import { ContinuityRepairPaymentService } from "@/payments/continuity-repair-payment-service";
+import { MissionPaymentService } from "@/payments/mission-payment-service";
 import type { PaymentProvider, ProviderPayment } from "@/payments/payment-provider";
 import { ContinuityService } from "./continuity-service";
 
@@ -98,6 +99,30 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     expect(selected.find((selection) => selection.needId === affected.needId)?.externalId).toContain("fresh-replacement");
     expect(selected.filter((selection) => selection.needId !== affected.needId).map((selection) => selection.id).sort()).toEqual(unaffectedIds);
     for (const [query, count] of calls) expect(count).toBe(/144Hz monitor/i.test(query) ? 3 : 2);
+  });
+
+  it("keeps the optimization header authority and payment amount synchronized to the selected portfolio", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
+    vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
+    const service = new ContinuityService(db);
+    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    missionId = built!.mission.id;
+
+    const selected = await service.selectPortfolio(missionId, "MAX_PERFORMANCE", built!.mission.version);
+    const authoritativePortfolio = selected!.decision!.portfolios.find((portfolio) => portfolio.type === selected!.decision!.selectedPortfolio)!;
+    expect(selected!.decision).toMatchObject({ selectedPortfolio: "MAX_PERFORMANCE", requiresRevalidation: true });
+    expect(selected!.mission.reservedPaise).toBe(authoritativePortfolio.totalPricePaise);
+    expect(selected!.mission.version).toBe(built!.mission.version + 1);
+
+    const provider = new RepairPaymentProvider();
+    const payments = new MissionPaymentService(provider, db);
+    await expect(payments.createOrder({ missionId, expectedVersion: selected!.mission.version, requestKey: `before-revalidation-${randomUUID()}` })).rejects.toMatchObject({ code: "PAYMENT_NOT_ALLOWED" });
+
+    const revalidated = await service.revalidate(missionId, selected!.mission.version);
+    expect(revalidated!.decision).toMatchObject({ selectedPortfolio: "MAX_PERFORMANCE", requiresRevalidation: false });
+    expect(revalidated!.mission.reservedPaise).toBe(authoritativePortfolio.totalPricePaise);
+    const order = await payments.createOrder({ missionId, expectedVersion: revalidated!.mission.version, requestKey: `after-revalidation-${randomUUID()}` });
+    expect(order.amount).toBe(authoritativePortfolio.totalPricePaise);
   });
 
   it("captures a separate repair payment exactly once without changing original committed authority", async () => {
