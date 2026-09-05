@@ -58,4 +58,18 @@ describe("OpenAIMissionPlanner", () => {
       code: "PLANNER_CONFIGURATION_MISSING",
     });
   });
+
+  it("uses the Groq-compatible Responses endpoint without unsupported store", async () => {
+    const output = { missionId: "mission", missionVersion: 2, selectedOffers: [{ offerId: "offer", observedOfferVersion: 1, category: "CAKE", reason: "proposal", constraintMapping: { deadline: null, vegetarian: null, people: null } }], rationale: "proposal only", totalAmount: 0 };
+    const fetcher = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(url).toBe("https://api.groq.com/openai/v1/responses");
+      const body = JSON.parse(String(init?.body));
+      expect(body).toMatchObject({ model: "openai/gpt-oss-120b", text: { format: { type: "json_schema", strict: true } } });
+      expect(body.store).toBeUndefined();
+      return new Response(JSON.stringify({ output_text: JSON.stringify(output) }), { status: 200 });
+    });
+    const planner = new OpenAIMissionPlanner({ provider: "groq", apiKey: "test-groq-key", modelId: "openai/gpt-oss-120b", fetcher: fetcher as typeof fetch });
+    await expect(planner.createPlan(input)).resolves.toEqual(output);
+    expect(planner.plannerId).toBe("groq-responses");
+  });
 });

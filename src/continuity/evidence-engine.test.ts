@@ -33,6 +33,7 @@ describe("EvidenceDecisionEngine", () => {
     expect(inferDecisionProfile("build the cheapest setup").profile).toBe("CHEAPEST");
     expect(inferDecisionProfile("best performance under budget").profile).toBe("MAX_PERFORMANCE");
     expect(inferDecisionProfile("best value gaming setup").profile).toBe("BEST_VALUE");
+    expect(inferDecisionProfile("ordinary setup", "MAX_PERFORMANCE").profile).toBe("MAX_PERFORMANCE");
   });
 
   it("allocates marginal budget to the stronger monitor gain instead of a weak keyboard upgrade", () => {

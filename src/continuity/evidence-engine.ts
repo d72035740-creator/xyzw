@@ -86,7 +86,11 @@ function evidenceTypeFor(requested: EvidenceType, identity: ProductIdentity, lin
   return requested;
 }
 
-export function inferDecisionProfile(goal: string): { profile: DecisionProfile; weights: DecisionWeights } {
+export function inferDecisionProfile(goal: string, declaredIntent?: MissionSpec["optimizationIntent"]): { profile: DecisionProfile; weights: DecisionWeights } {
+  if (declaredIntent === "CHEAPEST") return { profile: "CHEAPEST", weights: { requirementFit: .3, productQuality: .15, communityReliability: .05, priceEfficiency: .45, evidenceConfidence: .05 } };
+  if (declaredIntent === "MAX_PERFORMANCE") return { profile: "MAX_PERFORMANCE", weights: { requirementFit: .3, productQuality: .4, communityReliability: .1, priceEfficiency: .05, evidenceConfidence: .15 } };
+  if (declaredIntent === "RELIABILITY") return { profile: "BEST_VALUE", weights: { requirementFit: .25, productQuality: .2, communityReliability: .3, priceEfficiency: .1, evidenceConfidence: .15 } };
+  if (declaredIntent === "BEST_VALUE" || declaredIntent === "BALANCED") return { profile: "BEST_VALUE", weights: { requirementFit: .3, productQuality: .25, communityReliability: .15, priceEfficiency: .15, evidenceConfidence: .15 } };
   if (/\b(?:cheapest|lowest price|most affordable)\b/i.test(goal)) return { profile: "CHEAPEST", weights: { requirementFit: .3, productQuality: .15, communityReliability: .05, priceEfficiency: .45, evidenceConfidence: .05 } };
   if (/\b(?:max(?:imum)? performance|best performance|highest performance)\b/i.test(goal)) return { profile: "MAX_PERFORMANCE", weights: { requirementFit: .3, productQuality: .4, communityReliability: .1, priceEfficiency: .05, evidenceConfidence: .15 } };
   if (/\b(?:reliable|reliability)\b/i.test(goal)) return { profile: "BEST_VALUE", weights: { requirementFit: .25, productQuality: .2, communityReliability: .3, priceEfficiency: .1, evidenceConfidence: .15 } };
@@ -135,7 +139,7 @@ export class EvidenceDecisionEngine {
   constructor(private readonly connector = new EvidenceSearchConnector()) {}
 
   async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
-    const { profile, weights } = inferDecisionProfile(spec.goal);
+    const { profile, weights } = inferDecisionProfile(spec.goal, spec.optimizationIntent);
     const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).filter((candidate) => hardConstraints(need, candidate).satisfied).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, 5));
     if (shortlists.some((shortlist) => !shortlist.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "No candidate satisfies every deterministic hard constraint", 409);
 

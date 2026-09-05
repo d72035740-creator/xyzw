@@ -4,6 +4,10 @@ export const missionNeedKindSchema = z.enum(["PRODUCT", "LOCAL_SERVICE", "RESTAU
 export const missionNeedSchema = z.object({
   id: z.string().min(1), label: z.string().min(1), quantity: z.number().int().positive(),
   kind: missionNeedKindSchema.default("OTHER_COMMERCE"),
+  required: z.boolean().optional(),
+  grounding: z.object({ explicit: z.boolean(), inferred: z.boolean(), sourcePhrase: z.string().min(1).nullable() }).optional(),
+  rationale: z.string().min(1).optional(),
+  constraints: z.array(z.string().min(1)).optional(),
   searchQueries: z.array(z.string().min(1)).min(1),
   requiredAttributes: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
   preferredAttributes: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
@@ -26,9 +30,11 @@ const persistedMissionLocationSchema = z.preprocess((value) => {
 }, missionLocationSchema.optional());
 export const missionSpecSchema = z.object({
   goal: z.string().min(1), budgetPaise: z.number().int().positive(), currency: z.literal("INR"),
-  location: persistedMissionLocationSchema, deadline: z.string().datetime().optional(),
+  location: persistedMissionLocationSchema, deadline: z.string().datetime().optional(), deadlineText: z.string().min(1).optional(),
+  optimizationIntent: z.enum(["CHEAPEST", "BEST_VALUE", "MAX_PERFORMANCE", "RELIABILITY", "BALANCED"]).optional(),
+  preferences: z.array(z.string().min(1)).optional(),
   participants: z.array(z.object({ label: z.string().min(1), count: z.number().int().positive().optional(), role: z.string().min(1).optional() })).default([]),
-  needs: z.array(missionNeedSchema).min(1), globalConstraints: z.array(z.object({ id: z.string(), description: z.string() })),
+  needs: z.array(missionNeedSchema), globalConstraints: z.array(z.object({ id: z.string(), description: z.string(), type: z.string().optional(), value: z.string().optional(), hard: z.boolean().optional(), sourcePhrase: z.string().min(1).nullable().optional() })),
   outcome: z.object({ requiredNeedIds: z.array(z.string()), predicates: z.array(z.object({ id: z.string(), description: z.string(), type: z.string(), needId: z.string().optional(), key: z.string().optional(), operator: z.string().optional(), expected: z.unknown().optional() })) }),
   repairAuthority: z.object({ allowAutomaticSubstitution: z.boolean(), maxAdditionalSpendPaise: z.number().int().nonnegative() }),
 });

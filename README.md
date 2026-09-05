@@ -86,10 +86,11 @@ then reloads persisted offers and deterministically enforces mission/offer versi
 deadline, category completeness, vegetarian and capacity constraints, and integer-paise budget.
 Only the orchestration service can advance mission state or call the merchant/authority layers.
 
-Set `MISSIONPAY_PLANNER_PROVIDER=mock` for the deterministic local demo. For the real server-side
-Responses API adapter, use `MISSIONPAY_PLANNER_PROVIDER=openai`, `OPENAI_PLANNER_MODEL`, and
-`OPENAI_API_KEY`. Credentials are never included in planner input, audit events, API responses, or
-`agent_runs`.
+Set `MISSIONPAY_PLANNER_PROVIDER=mock` for the deterministic local demo. For the live server-side
+Groq Responses adapter, use `MISSIONPAY_PLANNER_PROVIDER=groq`,
+`MISSIONPAY_PLANNER_MODEL=openai/gpt-oss-120b`, and `GROQ_API_KEY`. The existing OpenAI adapter
+remains selectable with `MISSIONPAY_PLANNER_PROVIDER=openai`, `OPENAI_PLANNER_MODEL`, and
+`OPENAI_API_KEY`. Credentials are never included in compiler input, diagnostics, or API responses.
 
 Planning follows `DRAFT -> PLANNING -> PROPOSED -> RESERVING -> READY_TO_COMMIT`. A failed
 multi-reservation attempt releases only reservations created by that attempt and records the
@@ -194,9 +195,9 @@ Required live configuration:
 MISSIONPAY_MARKET_MODE=live
 SERPAPI_API_KEY=
 MISSIONPAY_MARKET_FRESHNESS_SECONDS=180
-MISSIONPAY_PLANNER_PROVIDER=openai
-OPENAI_API_KEY=
-OPENAI_PLANNER_MODEL=
+MISSIONPAY_PLANNER_PROVIDER=groq
+MISSIONPAY_PLANNER_MODEL=openai/gpt-oss-120b
+GROQ_API_KEY=
 MISSIONPAY_DEMO_MODE=true
 ```
 

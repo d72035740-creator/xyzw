@@ -10,7 +10,7 @@ import { OpenAIMissionPlanner } from "./openai-mission-planner";
 const planner =
   process.env.MISSIONPAY_PLANNER_PROVIDER === "mock"
     ? new MockMissionPlanner()
-    : new OpenAIMissionPlanner();
+    : new OpenAIMissionPlanner({ provider: process.env.MISSIONPAY_PLANNER_PROVIDER === "groq" ? "groq" : "openai" });
 const authority = new MissionAuthority(new PostgresMissionAuthorityStore(db));
 
 export const missionPlanningService = new MissionPlanningService(

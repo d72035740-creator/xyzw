@@ -1,42 +1,72 @@
 import { ContinuityError, type MissionNeed, type MissionSpec } from "./types";
 
-const personOrRelationship = /^(?:my\s+)?(?:girlfriend|boyfriend|partner|wife|husband|spouse|parents?|mother|father|mom|mum|dad|friends?|team|professor|teacher|colleagues?|coworkers?|guests?|people|person|children?|kids?)$/i;
-const peopleContext = /^(?:for\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:people|persons?|guests?|adults?|children|kids)$/i;
-const dateOrTime = /^(?:today|tonight|tomorrow|yesterday|next\s+\w+|this\s+\w+|\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{4}-\d{2}-\d{2})$/i;
-const budget = /^(?:under|below|within|budget|max(?:imum)?)?\s*(?:₹|rs\.?|inr|usd|\$)\s*[\d,.]+$/i;
-const contextOnly = /^(?:birthday|anniversary|celebration|romantic|premium|cheap|affordable|urgent|special|surprise|nearby|local)$/i;
+export type MissionSemanticErrorCode =
+  | "NO_ACTIONABLE_COMMERCE_NEEDS"
+  | "PARTICIPANT_CLASSIFIED_AS_NEED"
+  | "MISSION_NEED_TOO_VAGUE"
+  | "UNSUPPORTED_OPTIONAL_NEED"
+  | "INVALID_GROUNDING"
+  | "INVALID_DEADLINE_GROUNDING"
+  | "INVALID_HARD_CONSTRAINT"
+  | "INVALID_MISSION_DEPENDENCY"
+  | "DUPLICATE_MISSION_NEED"
+  | "INVALID_OUTCOME_REQUIREMENT";
 
-const explicitCategories = [
-  { label: /\b(?:flowers?|bouquet)\b/i, goal: /\b(?:flowers?|bouquet)\b/i },
-  { label: /\b(?:gifts?|present)\b/i, goal: /\b(?:gifts?|present)\b/i },
-  { label: /\b(?:cakes?)\b/i, goal: /\b(?:cakes?)\b/i },
-  { label: /\b(?:jewellery|jewelry|necklace|ring)\b/i, goal: /\b(?:jewellery|jewelry|necklace|ring)\b/i },
-  { label: /\b(?:restaurant|dinner|dining|meal)\b/i, goal: /\b(?:restaurant|dinner|dining|meal)\b/i },
-] as const;
+const legacyPersonOrRelationship = /^(?:my\s+)?(?:girlfriend|boyfriend|partner|wife|husband|spouse|parents?|mother|father|mom|mum|dad|friends?|team|professor|teacher|colleagues?|coworkers?|guests?|people|person|children?|kids?)$/i;
+const contextOnly = /^(?:setup|equipment|things?|everything|experience|event|occasion|person|people|guests?|location|budget|deadline)$/i;
+const normalized = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-function invalidReason(need: MissionNeed, goal: string, locationLabel?: string) {
-  const label = need.label.trim();
-  if (personOrRelationship.test(label) || peopleContext.test(label)) return "PARTICIPANT_OR_RELATIONSHIP";
-  if (dateOrTime.test(label)) return "DATE_OR_TIME";
-  if (budget.test(label)) return "BUDGET";
-  if (contextOnly.test(label)) return "CONTEXT_ONLY";
-  const locations = locationLabel?.split(",").map((part) => part.trim().toLowerCase()).filter(Boolean) ?? [];
-  if (locations.includes(label.toLowerCase())) return "LOCATION";
-  if (explicitCategories.some((category) => category.label.test(label) && !category.goal.test(goal))) return "UNREQUESTED_COMMERCE_CATEGORY";
-  return null;
+function participantNeed(need: MissionNeed, spec: MissionSpec) {
+  const label = normalized(need.label);
+  if (legacyPersonOrRelationship.test(need.label.trim())) return true;
+  if (/^(?:for\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:people|persons?|guests?|participants?)$/i.test(need.label.trim())) return true;
+  return spec.participants.some((participant) => {
+    const person = normalized(participant.label);
+    return person.length > 1 && (label === person || label === `my ${person}`);
+  });
+}
+
+export function inspectMissionNeeds(spec: MissionSpec, sourceGoal = spec.goal): { valid: boolean; errorCodes: MissionSemanticErrorCode[] } {
+  const errors = new Set<MissionSemanticErrorCode>();
+  if (!spec.needs.length) errors.add("NO_ACTIONABLE_COMMERCE_NEEDS");
+  const ids = new Set<string>();
+  const goal = normalized(sourceGoal);
+  const hasStatedDeadline = /\b(?:today|tonight|tomorrow|next\s+(?:day|week|month)|(?:within|in|have)\s+\d+\s+(?:minutes?|hours?|days?|weeks?)|by\s+[^,.]+)/i.test(sourceGoal);
+  if ((spec.deadline || spec.deadlineText) && !hasStatedDeadline) errors.add("INVALID_DEADLINE_GROUNDING");
+
+  for (const need of spec.needs) {
+    const label = need.label.trim();
+    if (ids.has(need.id)) errors.add("DUPLICATE_MISSION_NEED");
+    ids.add(need.id);
+    if (label.length < 3 || contextOnly.test(label)) errors.add("MISSION_NEED_TOO_VAGUE");
+    if (spec.location && label === normalized(spec.location.label)) errors.add("MISSION_NEED_TOO_VAGUE");
+    if (need.required === false) errors.add("UNSUPPORTED_OPTIONAL_NEED");
+    if (participantNeed(need, spec)) errors.add("PARTICIPANT_CLASSIFIED_AS_NEED");
+    if (need.grounding) {
+      const { explicit, inferred, sourcePhrase } = need.grounding;
+      if (explicit === inferred) errors.add("INVALID_GROUNDING");
+      if (explicit && (!sourcePhrase || !goal.includes(normalized(sourcePhrase)))) errors.add("INVALID_GROUNDING");
+      if (inferred) {
+        const groundedInOutcome = Boolean(sourcePhrase && goal.includes(normalized(sourcePhrase)));
+        const groundedByDependency = need.dependencies.length > 0 && need.dependencies.every((dependency) => dependency !== need.id);
+        if (!groundedInOutcome && !groundedByDependency) errors.add("INVALID_GROUNDING");
+        if (!need.rationale || need.rationale.trim().length < 8) errors.add("INVALID_GROUNDING");
+      }
+    }
+  }
+
+  for (const need of spec.needs) if (need.dependencies.some((dependency) => !ids.has(dependency))) errors.add("INVALID_MISSION_DEPENDENCY");
+  if (spec.outcome.requiredNeedIds.some((id) => !ids.has(id))) errors.add("INVALID_OUTCOME_REQUIREMENT");
+  for (const constraint of spec.globalConstraints) {
+    if (constraint.hard && constraint.type !== "BUDGET" && (!constraint.sourcePhrase || !goal.includes(normalized(constraint.sourcePhrase)))) errors.add("INVALID_HARD_CONSTRAINT");
+  }
+  return { valid: errors.size === 0, errorCodes: [...errors] };
 }
 
 export function validateMissionNeeds(spec: MissionSpec, sourceGoal = spec.goal): MissionSpec {
-  for (const need of spec.needs) {
-    const reason = invalidReason(need, sourceGoal, spec.location?.label);
-    if (reason) {
-      throw new ContinuityError(
-        "INVALID_MISSION_NEED",
-        `“${need.label}” is mission context, not something MissionPay can purchase or book.`,
-        422,
-        { needId: need.id, reason },
-      );
-    }
+  const result = inspectMissionNeeds(spec, sourceGoal);
+  if (!result.valid) {
+    throw new ContinuityError("INVALID_MISSION_NEED", "Mission interpretation is not grounded enough for market execution.", 422, { reason: result.errorCodes[0], validatorErrorCodes: result.errorCodes });
   }
   return spec;
 }
