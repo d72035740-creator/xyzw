@@ -30,7 +30,7 @@ function openAICompiler(outputs: unknown[], logger = { info: vi.fn() }) {
 function groqCompiler(outputs: unknown[], logger = { info: vi.fn() }) {
   vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
   const fetcher = vi.fn();
-  for (const output of outputs) fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ output_text: typeof output === "string" ? output : JSON.stringify(output) }), { status: 200 }));
+  for (const output of outputs) fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: typeof output === "string" ? output : JSON.stringify(output) } }] }), { status: 200 }));
   return { compiler: new MissionCompiler(fetcher as typeof fetch, logger, async () => {}), fetcher, logger };
 }
 function assertStrictObjectSchema(value: unknown, path = "root") {
@@ -259,7 +259,7 @@ describe("MissionCompiler", () => {
     await expect(compiler.compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE" });
   });
 
-  it("uses Groq Responses with the unchanged strict MissionSpec schema", async () => {
+  it("uses Groq Chat Completions with the unchanged strict MissionSpec schema", async () => {
     const goal = "Buy flowers under ₹1,000";
     const output = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
     const { compiler, fetcher, logger } = groqCompiler([output]);
@@ -267,23 +267,20 @@ describe("MissionCompiler", () => {
     expect(spec.needs[0].label).toBe("Flowers");
     expect(fetcher).toHaveBeenCalledTimes(1);
     const [url, init] = fetcher.mock.calls[0];
-    expect(url).toBe("https://api.groq.com/openai/v1/responses");
+    expect(url).toBe("https://api.groq.com/openai/v1/chat/completions");
     expect(init?.headers).toMatchObject({ Authorization: "Bearer test-groq-key" });
     const body = JSON.parse(init?.body as string);
-    expect(body).toMatchObject({ model: "openai/gpt-oss-120b", text: { format: { type: "json_schema", name: "mission_spec", strict: true } } });
-    for (const unsupported of ["store", "truncation", "include", "previous_response_id", "safety_identifier", "prompt_cache_key", "prompt", "response_format"]) expect(body[unsupported]).toBeUndefined();
-    expect(body.text.format.schema.required).toContain("needs");
+    expect(body).toMatchObject({ model: "openai/gpt-oss-120b", messages: [{ role: "system" }, { role: "user", content: goal }], response_format: { type: "json_schema", json_schema: { name: "mission_spec", strict: true } }, temperature: 0 });
+    for (const unsupported of ["store", "truncation", "include", "previous_response_id", "safety_identifier", "prompt_cache_key", "prompt", "text", "instructions", "input"]) expect(body[unsupported]).toBeUndefined();
+    expect(body.response_format.json_schema.schema.required).toContain("needs");
     expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_DIAGNOSTIC", expect.objectContaining({ compilerProvider: "groq", modelId: "openai/gpt-oss-120b", validationResult: "VALID" }));
   });
 
-  it("extracts assistant structured output after a preceding GPT-OSS reasoning item", async () => {
+  it("parses only Chat Completions message content", async () => {
     const goal = "Buy flowers under ₹1,000";
     const output = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
-    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output: [
-      { type: "reasoning", content: [{ type: "reasoning_text", text: "private reasoning that must be ignored" }] },
-      { type: "message", role: "assistant", content: [{ type: "output_text", text: JSON.stringify(output) }] },
-    ] }), { status: 200 }));
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(output), reasoning: "private reasoning that must be ignored" } }] }), { status: 200 }));
     const spec = await new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }).compile({ goal, maximumAuthorityPaise: 100_000 });
     expect(spec.needs).toEqual([expect.objectContaining({ label: "Flowers" })]);
     expect(fetcher).toHaveBeenCalledTimes(1);
@@ -301,8 +298,9 @@ describe("MissionCompiler", () => {
     expect((await compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).needs).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(logger.info).not.toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.anything());
-    expect(JSON.parse(JSON.parse(fetcher.mock.calls[1][1]?.body as string).input).validatorErrorCodes).toEqual(["NO_ACTIONABLE_COMMERCE_NEEDS"]);
-    expect(JSON.parse(fetcher.mock.calls[1][1]?.body as string).instructions).toContain("identify only a genuinely indispensable CORE_REQUIREMENT");
+    const repairBody = JSON.parse(fetcher.mock.calls[1][1]?.body as string);
+    expect(repairBody.messages[0].content).toContain("NO_ACTIONABLE_COMMERCE_NEEDS");
+    expect(repairBody.messages[0].content).toContain("identify only a genuinely indispensable CORE_REQUIREMENT");
   });
 
   it("retries Groq json_validate_failed once and then accepts a valid MissionSpec", async () => {
@@ -312,7 +310,7 @@ describe("MissionCompiler", () => {
     const logger = { info: vi.fn() };
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "json_validate_failed", message: "Regenerate strict output" } }), { status: 400, headers: { "x-request-id": "req_retry" } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ output_text: JSON.stringify(valid) }), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(valid) } }] }), { status: 200 }));
     const compiler = new MissionCompiler(fetcher as typeof fetch, logger, async () => {});
     expect((await compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).needs).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -325,7 +323,7 @@ describe("MissionCompiler", () => {
     const valid = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
     const fetcher = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ error: { type: "server_error", code: "temporarily_unavailable" } }), { status: 503 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ output_text: JSON.stringify(valid) }), { status: 200 }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(valid) } }] }), { status: 200 }));
     const compiler = new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }, async () => {});
     await expect(compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).resolves.toMatchObject({ budgetPaise: 100_000 });
     expect(fetcher).toHaveBeenCalledTimes(2);
@@ -340,14 +338,14 @@ describe("MissionCompiler", () => {
     expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 1, httpStatus: 401, retrying: false }));
   });
 
-  it("fails after exactly two retryable Groq provider attempts", async () => {
+  it("fails after exactly two transient Groq provider attempts", async () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
-    const failure = () => new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "json_validate_failed" } }), { status: 400 });
+    const failure = () => new Response(JSON.stringify({ error: { type: "server_error", code: "temporarily_unavailable" } }), { status: 503 });
     const logger = { info: vi.fn() };
     const fetcher = vi.fn().mockResolvedValueOnce(failure()).mockResolvedValueOnce(failure());
     await expect(new MissionCompiler(fetcher as typeof fetch, logger, async () => {}).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE" });
     expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(logger.info).toHaveBeenLastCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 2, errorCode: "json_validate_failed", retrying: false }));
+    expect(logger.info).toHaveBeenLastCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 2, httpStatus: 503, retrying: false }));
   });
 
   it("reports Groq configuration and provider failures without mock fallback", async () => {
