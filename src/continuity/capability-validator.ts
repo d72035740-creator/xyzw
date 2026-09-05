@@ -33,7 +33,10 @@ export function deriveCapabilityRequirements(spec: MissionSpec, need: MissionNee
     hard: true, provenance: provenance(need),
   }));
   const semanticText = [need.label, ...(need.constraints ?? [])].join(" ");
-  for (const definition of booleanCapabilities) if (definition.requirement.test(semanticText) && !result.some((item) => item.capability === definition.capability)) result.push({ capability: definition.capability, operator: "BOOLEAN", value: true, hard: true, provenance: provenance(need) });
+  // Portability is an explicit whole-kit constraint; unlike outdoor suitability,
+  // it applies to every component without inventing category requirements.
+  const missionRequiresPortable = /\bportable\b/i.test(spec.goal);
+  for (const definition of booleanCapabilities) if ((definition.requirement.test(semanticText) || (definition.capability === "portable" && missionRequiresPortable)) && !result.some((item) => item.capability === definition.capability)) result.push({ capability: definition.capability, operator: "BOOLEAN", value: true, hard: true, provenance: provenance(need) });
   for (const match of semanticText.matchAll(unitPattern)) {
     const unit = unitName(match[2]);
     result.push({ capability: `rated_${unit.toLowerCase()}`, operator: "MIN", value: Number(match[1]), unit, hard: true, provenance: provenance(need) });
@@ -95,10 +98,12 @@ export function assessCapabilities(spec: MissionSpec, need: MissionNeed, candida
 export function priceIdentityRisk(candidate: CapabilityCandidate, peers: CapabilityCandidate[], identityConfidence: "LOW" | "MEDIUM" | "HIGH") {
   const sorted = peers.map((item) => item.pricePaise).filter((price) => price > 0).sort((a, b) => a - b);
   const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : candidate.pricePaise;
-  const anomaly = sorted.length >= 4 && candidate.pricePaise < median * 0.25;
+  // A price is suspicious only in relation to comparable live peers. This has no
+  // category-specific rupee floor and deliberately fails closed when identity is weak.
+  const anomaly = sorted.length >= 3 && candidate.pricePaise < median * 0.25;
   const risks: string[] = [];
   if (anomaly) risks.push("PRICE_ANOMALY");
-  if (anomaly && !/\b[A-Z]*\d+[A-Z0-9-]{2,}\b/i.test(candidate.title)) risks.push("VARIANT_AMBIGUOUS");
+  if (anomaly && identityConfidence !== "HIGH") risks.push("VARIANT_AMBIGUOUS");
   if (identityConfidence === "LOW") risks.push("PRODUCT_IDENTITY_LOW_CONFIDENCE");
   return risks;
 }

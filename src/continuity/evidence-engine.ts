@@ -173,22 +173,40 @@ function diverseShortlist(candidates: SnapshotCandidate[], limit: number) {
     const score = (candidate: SnapshotCandidate) => Object.entries(candidate.attributes).reduce((total, [key, value]) => total + (key.startsWith("rated_") && typeof value === "number" ? value : value === true ? 1_000 : 0), 0) + (typeof candidate.evidence?.rating === "number" ? candidate.evidence.rating as number * 100 : 0);
     return score(b) - score(a) || b.pricePaise - a.pricePaise;
   });
+  const strongestEvidence = [...candidates].sort((a, b) => {
+    const score = (candidate: SnapshotCandidate) => (typeof candidate.evidence?.rating === "number" ? candidate.evidence.rating as number * 1_000 : 0) + (typeof candidate.evidence?.reviewCount === "number" ? Math.min(500, candidate.evidence.reviewCount as number) : 0);
+    return score(b) - score(a) || b.pricePaise - a.pricePaise;
+  });
   const premium = [...candidates].sort((a, b) => b.pricePaise - a.pricePaise);
-  return [...new Map([...cheapest.slice(0, 3), ...strength.slice(0, 3), ...premium.slice(0, 3)].map((candidate) => [candidate.id, candidate])).values()].slice(0, limit);
+  // Retain a deliberate mix: cheapest, strongest capability, strongest evidence,
+  // and premium/high-utility candidates before filling the remaining capacity.
+  const selected = [cheapest[0], strength[0], strongestEvidence[0], premium[0], ...cheapest, ...strength, ...strongestEvidence, ...premium]
+    .filter((candidate): candidate is SnapshotCandidate => Boolean(candidate));
+  return [...new Map(selected.map((candidate) => [candidate.id, candidate])).values()].slice(0, Math.max(limit, 4));
 }
 
-export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise: number): DecisionPortfolio[] {
+export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise: number, requireLiveQualityEvidence = false): DecisionPortfolio[] {
   if (groups.some((group) => !group.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "Every required need needs at least one evidence-qualified candidate", 409);
   const feasible = combinations(groups.map((group) => group.slice(0, 5))).map((items) => ({ items, total: items.reduce((sum, item) => sum + item.currentPricePaise, 0), utility: items.reduce((sum, item) => sum + item.scores.utility, 0) / items.length })).filter((portfolio) => portfolio.total <= budgetPaise);
   if (!feasible.length) throw new ContinuityError("BUDGET_EXCEEDED", "No complete evidence-qualified portfolio fits inside authority", 409);
   const cheapest = [...feasible].sort((a, b) => a.total - b.total || b.utility - a.utility)[0];
-  const stronglyProven = feasible.filter((portfolio) => portfolio.items.every((item) => !item.riskFlags.includes("PRICE_ANOMALY") || (item.identityConfidence === "HIGH" && item.evidenceCounts.officialSources >= 2)));
-  const qualityEligible = stronglyProven.length ? stronglyProven : feasible;
+  const qualityEligible = feasible.filter((portfolio) => portfolio.items.every((item) =>
+    !item.riskFlags.includes("PRICE_ANOMALY")
+    && !item.riskFlags.includes("VARIANT_AMBIGUOUS")
+    && item.identityConfidence !== "LOW"
+    && item.scores.requirementFit === 100
+    && item.scores.productQuality >= 55
+    && item.scores.evidenceConfidence >= 50
+    && (!requireLiveQualityEvidence || item.identityConfidence === "HIGH" || item.evidenceCounts.officialSources + item.evidenceCounts.professionalSources > 0),
+  ));
+  if (!qualityEligible.length) throw new ContinuityError("NO_QUALITY_MARKET_OFFER", "No sufficiently identified, capable, and evidenced portfolio is available within authority", 409);
   const performance = [...qualityEligible].sort((a, b) => b.utility - a.utility || a.total - b.total)[0];
   const bestValue = [...qualityEligible].sort((a, b) => {
     const aGain = Math.max(0, a.utility - cheapest.utility), bGain = Math.max(0, b.utility - cheapest.utility);
     const aExtra = Math.max(1, a.total - cheapest.total), bExtra = Math.max(1, b.total - cheapest.total);
-    return (b.utility + 12 * bGain / bExtra * 100000) - (a.utility + 12 * aGain / aExtra * 100000) || a.total - b.total;
+    // Best Value rewards verified utility gained per additional paise more than
+    // Max Performance does; price remains a constraint, never a quality proxy.
+    return (b.utility + 40 * bGain / bExtra * 100000) - (a.utility + 40 * aGain / aExtra * 100000) || a.total - b.total;
   })[0];
   const make = (type: PortfolioType, label: string, value: typeof cheapest, tradeOff: string): DecisionPortfolio => ({ type, label, itemSnapshotIds: value.items.map((item) => item.offerSnapshotId), totalPricePaise: value.total, missionUtility: Math.round(value.utility), marginalValue: Math.round(Math.max(0, value.utility - cheapest.utility) * 100000 / Math.max(1, value.total - cheapest.total) * 100) / 100, tradeOff });
   const portfolios = [make("CHEAPEST_VALID", "Cheapest valid", cheapest, "Lowest-priced complete mission satisfying verified hard requirements."), make("BEST_VALUE", "Best value", bestValue, "Strongest marginal quality and evidence gain for the additional spend."), make("MAX_PERFORMANCE", "Max performance", performance, "Highest ranking utility found without exceeding authority.")];
@@ -210,7 +228,9 @@ export class EvidenceDecisionEngine {
     for (const candidate of shortlists.flat()) evidence.push({ missionId, needId: candidate.needId, offerSnapshotId: candidate.id, type: "MERCHANT", sourceName: candidate.merchantName, sourceUrl: candidate.sourceUrl ?? undefined, title: candidate.title, snippet: typeof candidate.evidence?.snippet === "string" ? candidate.evidence.snippet : undefined, observedAt: new Date(), evidenceMode: "SEARCH_EVIDENCE", productIdentityConfidence: "HIGH", extractedFacts: candidate.attributes, sentiment: {} });
 
     if (live) {
-      const researchJobs: Array<() => Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => shortlist.slice(0, 2).map((candidate) => {
+      // The diversified shortlist is ordered intentionally; research each retained
+      // representative rather than only the first cheap search results.
+      const researchJobs: Array<() => Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => shortlist.slice(0, 4).map((candidate) => {
         const identity = productIdentity(candidate.title); const identityQuery = [identity.brand, identity.modelNumber, identity.size].filter(Boolean).join(" ") || candidate.title;
         return async () => ({ candidate, type: "OFFICIAL_SPEC" as const, results: await this.connector.search(`${identityQuery} official specifications`) });
       }));
@@ -257,7 +277,7 @@ export class EvidenceDecisionEngine {
         assessments.push({ offerSnapshotId: entry.candidate.id, needId: need.id, title: entry.candidate.title, currentPricePaise: entry.candidate.pricePaise * need.quantity, identity: entry.identity, identityConfidence: entry.identityLevel, hardConstraints: entry.hard, capabilityChecks: entry.capabilityChecks, scores: { requirementFit, productQuality: quality, communityReliability: entry.reliability, evidenceConfidence: entry.confidenceScore, priceEfficiency, utility }, evidenceCounts: { officialSources: entry.official, professionalSources: entry.professional, communityDiscussions: entry.community, merchantSources: 1 }, recurringPositives: entry.positives, recurringNegatives: entry.negatives, riskFlags: [...entry.risks, ...(entry.confidenceScore < 50 ? ["LOW_EVIDENCE_CONFIDENCE"] : []), ...(entry.negatives.length ? ["RECURRING_COMPLAINTS"] : [])] });
       }
     }
-    const portfolios = optimizePortfolios(spec.needs.map((need) => assessments.filter((assessment) => assessment.needId === need.id && assessment.hardConstraints.satisfied && (!live || assessment.identityConfidence !== "LOW") && !assessment.riskFlags.includes("VARIANT_AMBIGUOUS")).sort((a, b) => b.scores.utility - a.scores.utility).slice(0, 5)), spec.budgetPaise);
+    const portfolios = optimizePortfolios(spec.needs.map((need) => assessments.filter((assessment) => assessment.needId === need.id && assessment.hardConstraints.satisfied && (!live || assessment.identityConfidence !== "LOW") && !assessment.riskFlags.includes("VARIANT_AMBIGUOUS")).sort((a, b) => b.scores.utility - a.scores.utility).slice(0, 5)), spec.budgetPaise, live);
     const selectedPortfolio: PortfolioType = profile === "CHEAPEST" ? "CHEAPEST_VALID" : profile === "MAX_PERFORMANCE" ? "MAX_PERFORMANCE" : "BEST_VALUE";
     return { profile, weights, evidence, assessments, portfolios, selectedPortfolio };
   }

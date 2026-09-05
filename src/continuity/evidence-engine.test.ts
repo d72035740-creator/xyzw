@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { EvidenceDecisionEngine, EvidenceSearchConnector, SerperEvidenceSearchConnector, inferDecisionProfile, optimizePortfolios, productIdentity, type CandidateAssessment } from "./evidence-engine";
-import { validateMissionPortfolio } from "./capability-validator";
+import { priceIdentityRisk, validateMissionPortfolio } from "./capability-validator";
 import { extractListingCapabilities } from "./market-gateway";
 import type { MissionSpec } from "./types";
 
@@ -61,6 +61,30 @@ describe("EvidenceDecisionEngine", () => {
     const portfolios = optimizePortfolios([[assessment("only-valid", "need", 100_000, 80)]], 200_000);
     expect(portfolios.find((portfolio) => portfolio.type === "BEST_VALUE")?.tradeOff).toContain("SAME OPTIMAL PORTFOLIO");
     expect(portfolios.find((portfolio) => portfolio.type === "MAX_PERFORMANCE")?.tradeOff).toContain("SAME OPTIMAL PORTFOLIO");
+  });
+
+  it("rejects peer-price anomalies from Best Value and Max Performance creator portfolios", () => {
+    const peer = (id: string, pricePaise: number) => ({ id, needId: "ssd", title: id, pricePaise, sourceUrl: "https://shop.test", sourceProvider: "serper", attributes: {}, evidence: null });
+    expect(priceIdentityRisk(peer("generic-1tb-ssd", 5_400), [peer("generic-1tb-ssd", 5_400), peer("portable-ssd-value", 650_000), peer("portable-ssd-premium", 900_000)], "MEDIUM")).toEqual(expect.arrayContaining(["PRICE_ANOMALY", "VARIANT_AMBIGUOUS"]));
+
+    const creatorNeedIds = ["action-camera", "wireless-microphone", "compact-tripod", "portable-ssd", "power-bank"];
+    const groups = creatorNeedIds.map((needId, index) => {
+      const anomalous = assessment(`${needId}-generic-cheap`, needId, index === 3 ? 5_400 : 110_000, 20);
+      anomalous.riskFlags = ["PRICE_ANOMALY", "VARIANT_AMBIGUOUS"];
+      anomalous.identityConfidence = "MEDIUM";
+      const value = assessment(`${needId}-verified-value`, needId, 600_000, 76);
+      const premium = assessment(`${needId}-verified-performance`, needId, 950_000, 93);
+      return [anomalous, value, premium];
+    });
+    const portfolios = optimizePortfolios(groups, 6_000_000, true);
+    const cheapest = portfolios.find((portfolio) => portfolio.type === "CHEAPEST_VALID")!;
+    const bestValue = portfolios.find((portfolio) => portfolio.type === "BEST_VALUE")!;
+    const maxPerformance = portfolios.find((portfolio) => portfolio.type === "MAX_PERFORMANCE")!;
+    expect(cheapest.itemSnapshotIds).toContain("portable-ssd-generic-cheap");
+    expect(bestValue.itemSnapshotIds).not.toContain("portable-ssd-generic-cheap");
+    expect(maxPerformance.itemSnapshotIds).not.toContain("portable-ssd-generic-cheap");
+    expect(bestValue.itemSnapshotIds).not.toEqual(maxPerformance.itemSnapshotIds);
+    expect(maxPerformance.itemSnapshotIds).toContain("portable-ssd-verified-performance");
   });
 
   it("does not require live evidence calls in sandbox mode", async () => {
