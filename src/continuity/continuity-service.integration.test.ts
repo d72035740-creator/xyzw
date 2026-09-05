@@ -88,7 +88,8 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     const shoppingFetcher = vi.fn(async (input: string | URL | Request) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url);
       const query = url.searchParams.get("q") ?? "product";
-      return new Response(JSON.stringify({ shopping_results: [{ product_id: query, title: query, source: "Test Shopping Merchant", extracted_price: 1000, product_link: `https://example.test/${encodeURIComponent(query)}` }] }), { status: 200 });
+      const title = /backup power/i.test(query) ? `${query} 1200VA` : query;
+      return new Response(JSON.stringify({ shopping_results: [{ product_id: query, title, source: "Test Shopping Merchant", extracted_price: 1000, product_link: `https://example.test/${encodeURIComponent(query)}` }] }), { status: 200 });
     });
     const gateway = new MarketGateway("live", [new SerpApiShoppingConnector("test-serpapi-key", shoppingFetcher as typeof fetch)]);
     const gatewaySearch = vi.spyOn(gateway, "search");

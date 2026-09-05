@@ -5,6 +5,7 @@ import { MissionCompiler } from "./mission-compiler";
 import { hasKnownPrice, MarketGateway, marketQueryFor } from "./market-gateway";
 import { ContinuityError, missionSpecSchema, type MarketOffer, type MissionLocationInput, type MissionNeed } from "./types";
 import { EvidenceDecisionEngine, type DecisionPortfolio } from "./evidence-engine";
+import { validateMissionPortfolio } from "./capability-validator";
 
 type DbTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 type MissionUnderstandingInput = { goal:string; maximumAuthorityPaise?:number; location?:MissionLocationInput|string; repairAllowancePaise?:number };
@@ -68,10 +69,12 @@ export class ContinuityService {
       const candidateMap=new Map([...offersByNeed].map(([needId,offers])=>[needId,offers.map(offer=>({id:offer.id,needId:offer.needId,title:offer.title,merchantName:offer.merchantName,sourceUrl:offer.sourceUrl,sourceProvider:offer.sourceProvider,pricePaise:offer.pricePaise,attributes:offer.attributes,evidence:offer.evidence}))]));
       let decision;
       try { decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live"); } catch(error) { throw evidenceStageError(error); }
+      const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
+      if(!chosen)throw new ContinuityError("PORTFOLIO_NOT_MISSION_VALID","Selected portfolio was not produced",409);
+      validateMissionPortfolio(spec,chosen.itemSnapshotIds,candidateMap,decision.assessments);
       if(decision.evidence.length)await this.database.insert(productEvidence).values(decision.evidence);
       if(decision.assessments.length)await this.database.insert(candidateAssessments).values(decision.assessments.map(assessment=>({missionId:mission.id,needId:assessment.needId,offerSnapshotId:assessment.offerSnapshotId,assessment,utilityScore:assessment.scores.utility})));
       await this.database.insert(decisionRuns).values({missionId:mission.id,profile:decision.profile,weights:decision.weights,portfolios:decision.portfolios,selectedPortfolio:decision.selectedPortfolio,status:"SUCCEEDED"});
-      const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
       return await this.reservePlan(mission.id,input.missionVersion,spec,offersByNeed,chosen?.itemSnapshotIds);
     }catch(error){await this.database.update(missions).set({status:"INVALIDATED",updatedAt:new Date()}).where(and(eq(missions.id,mission.id),eq(missions.version,input.missionVersion),eq(missions.status,"PLANNING")));throw error;}
   }

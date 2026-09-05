@@ -16,6 +16,26 @@ export function hasKnownPrice(offer: MarketOffer): offer is MarketOffer & { pric
   return typeof offer.pricePaise === "number" && Number.isInteger(offer.pricePaise) && offer.pricePaise > 0;
 }
 
+export function extractListingCapabilities(title: string, description = "") {
+  const text = `${title} ${description}`;
+  const capabilities: Record<string, unknown> = {};
+  if (/\b(?:outdoor|weatherproof|waterproof|ip\d{2})\b/i.test(text)) capabilities.outdoor_suitability = true;
+  if (/\b(?:weatherproof|waterproof|ip\d{2})\b/i.test(text)) capabilities.water_resistance = true;
+  if (/\b(?:portable|foldable|carry)\b/i.test(text)) capabilities.portable = true;
+  if (/\b(?:wireless|wi-?fi|bluetooth)\b/i.test(text)) capabilities.wireless = true;
+  if (/\b(?:powered|active|built[- ]in amplifier|integrated amplifier|all[- ]in[- ]one|party speaker|bluetooth speaker)\b/i.test(text)) capabilities.complete_system = true;
+  else if (/\bpassive\b/i.test(text) || (/\b(?:wall|ceiling)[-/ ]mounted speakers?\b/i.test(text) && !/\b(?:powered|active)\b/i.test(text))) capabilities.complete_system = false;
+  const unitPattern = /(\d+(?:\.\d+)?)\s*(hz|w|watts?|va|wh|ah|lumens?|lm|inches?|inch|cm|m)\b/gi;
+  const names: Record<string, string> = { watt: "w", watts: "w", w: "w", va: "va", wh: "wh", ah: "ah", hz: "hz", lumen: "lm", lumens: "lm", lm: "lm", inch: "in", inches: "in", cm: "cm", m: "m" };
+  for (const match of text.matchAll(unitPattern)) {
+    const key = `rated_${names[match[2].toLowerCase()] ?? match[2].toLowerCase()}`;
+    capabilities[key] = Math.max(typeof capabilities[key] === "number" ? capabilities[key] as number : 0, Number(match[1]));
+  }
+  const interfaces = [["HDMI", /\bhdmi\b/i], ["USB", /\busb(?:-c)?\b/i], ["BLUETOOTH", /\bbluetooth\b/i], ["WIFI", /\bwi-?fi\b/i], ["RJ45", /\brj-?45\b/i], ["3.5MM", /\b3\.5\s*mm\b/i]].filter(([, pattern]) => (pattern as RegExp).test(text)).map(([name]) => name as string);
+  if (interfaces.length) capabilities.interfaces = interfaces;
+  return capabilities;
+}
+
 export function marketQueryFor(need: MissionNeed, context: MarketSearchContext) {
   const base = need.label.trim();
   const location = context.locationLabel?.trim();
@@ -56,7 +76,7 @@ export class SerpApiShoppingConnector implements MarketConnector {
       const sourceUrl = item.product_link ?? item.link;
       const deliverySupported = Boolean(item.delivery && context.locationLabel && !/\b(?:not available|unavailable|cannot|can't|no delivery)\b/i.test(item.delivery));
       const lower = item.title.toLowerCase();
-      const attributes: Record<string, unknown> = { extraction: "listing-title-evidence", delivery: item.delivery ?? null, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN" };
+      const attributes: Record<string, unknown> = { ...extractListingCapabilities(item.title, item.snippet), extraction: "listing-title-evidence", delivery: item.delivery ?? null, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN" };
       for (const [key, expected] of Object.entries(need.requiredAttributes)) {
         if (key === "refreshRateHz") { const hz = lower.match(/(\d{2,3})\s*hz/); if (hz) attributes[key] = Number(hz[1]); }
         else if (typeof expected === "boolean" && expected && lower.includes(key.toLowerCase())) attributes[key] = true;

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { ContinuityError, type MissionNeed, type MissionSpec } from "./types";
+import { assessCapabilities, priceIdentityRisk, type CapabilityCheck } from "./capability-validator";
 
 export type EvidenceType = "OFFICIAL_SPEC" | "PROFESSIONAL_REVIEW" | "COMMUNITY" | "COMPARISON" | "MERCHANT";
 export type EvidenceConfidence = "LOW" | "MEDIUM" | "HIGH";
@@ -16,6 +17,7 @@ export type CandidateAssessment = {
   offerSnapshotId: string; needId: string; title: string; currentPricePaise: number;
   identity: ProductIdentity; identityConfidence: EvidenceConfidence;
   hardConstraints: { satisfied: boolean; failures: string[]; unknowns: string[] };
+  capabilityChecks: CapabilityCheck[];
   scores: { requirementFit: number; productQuality: number; communityReliability: number; evidenceConfidence: number; priceEfficiency: number; utility: number };
   evidenceCounts: { officialSources: number; professionalSources: number; communityDiscussions: number; merchantSources: number };
   recurringPositives: string[]; recurringNegatives: string[]; riskFlags: string[];
@@ -75,6 +77,12 @@ function identityConfidence(identity: ProductIdentity, evidenceTitle: string): E
 function sourceHost(link?: string) {
   try { return link ? new URL(link).hostname.replace(/^www\./, "") : "search-result"; } catch { return "search-result"; }
 }
+function meaningfulOverlap(requirement: string, candidate: string) {
+  const ignored = new Set(["the", "a", "an", "for", "with", "and", "or", "of", "to", "in", "on", "equipment", "product"]);
+  const tokens = (value: string) => (value.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((token) => token.length > 2 && !ignored.has(token));
+  const candidateTokens = new Set(tokens(candidate));
+  return tokens(requirement).some((token) => candidateTokens.has(token));
+}
 
 function evidenceTypeFor(requested: EvidenceType, identity: ProductIdentity, link?: string): EvidenceType {
   const host = sourceHost(link).toLowerCase();
@@ -125,14 +133,20 @@ export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise:
   const feasible = combinations(groups.map((group) => group.slice(0, 5))).map((items) => ({ items, total: items.reduce((sum, item) => sum + item.currentPricePaise, 0), utility: items.reduce((sum, item) => sum + item.scores.utility, 0) / items.length })).filter((portfolio) => portfolio.total <= budgetPaise);
   if (!feasible.length) throw new ContinuityError("BUDGET_EXCEEDED", "No complete evidence-qualified portfolio fits inside authority", 409);
   const cheapest = [...feasible].sort((a, b) => a.total - b.total || b.utility - a.utility)[0];
-  const performance = [...feasible].sort((a, b) => b.utility - a.utility || a.total - b.total)[0];
-  const bestValue = [...feasible].sort((a, b) => {
+  const stronglyProven = feasible.filter((portfolio) => portfolio.items.every((item) => !item.riskFlags.includes("PRICE_ANOMALY") || (item.identityConfidence === "HIGH" && item.evidenceCounts.officialSources >= 2)));
+  const qualityEligible = stronglyProven.length ? stronglyProven : feasible;
+  const performance = [...qualityEligible].sort((a, b) => b.utility - a.utility || a.total - b.total)[0];
+  const bestValue = [...qualityEligible].sort((a, b) => {
     const aGain = Math.max(0, a.utility - cheapest.utility), bGain = Math.max(0, b.utility - cheapest.utility);
     const aExtra = Math.max(1, a.total - cheapest.total), bExtra = Math.max(1, b.total - cheapest.total);
     return (b.utility + 12 * bGain / bExtra * 100000) - (a.utility + 12 * aGain / aExtra * 100000) || a.total - b.total;
   })[0];
   const make = (type: PortfolioType, label: string, value: typeof cheapest, tradeOff: string): DecisionPortfolio => ({ type, label, itemSnapshotIds: value.items.map((item) => item.offerSnapshotId), totalPricePaise: value.total, missionUtility: Math.round(value.utility), marginalValue: Math.round(Math.max(0, value.utility - cheapest.utility) * 100000 / Math.max(1, value.total - cheapest.total) * 100) / 100, tradeOff });
-  return [make("CHEAPEST_VALID", "Cheapest valid", cheapest, "Lowest-priced complete mission satisfying verified hard requirements."), make("BEST_VALUE", "Best value", bestValue, "Strongest marginal quality and evidence gain for the additional spend."), make("MAX_PERFORMANCE", "Max performance", performance, "Highest ranking utility found without exceeding authority.")];
+  const portfolios = [make("CHEAPEST_VALID", "Cheapest valid", cheapest, "Lowest-priced complete mission satisfying verified hard requirements."), make("BEST_VALUE", "Best value", bestValue, "Strongest marginal quality and evidence gain for the additional spend."), make("MAX_PERFORMANCE", "Max performance", performance, "Highest ranking utility found without exceeding authority.")];
+  return portfolios.map((portfolio, index) => {
+    const duplicate = portfolios.some((other, otherIndex) => otherIndex < index && other.itemSnapshotIds.join("|") === portfolio.itemSnapshotIds.join("|"));
+    return duplicate ? { ...portfolio, label: `${portfolio.label} · Same optimal portfolio`, tradeOff: `SAME OPTIMAL PORTFOLIO — ${portfolio.tradeOff}` } : portfolio;
+  });
 }
 
 export class EvidenceDecisionEngine {
@@ -140,7 +154,7 @@ export class EvidenceDecisionEngine {
 
   async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
     const { profile, weights } = inferDecisionProfile(spec.goal, spec.optimizationIntent);
-    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).filter((candidate) => hardConstraints(need, candidate).satisfied).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, 5));
+    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, 12));
     if (shortlists.some((shortlist) => !shortlist.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "No candidate satisfies every deterministic hard constraint", 409);
 
     const evidence: EvidenceRecordInput[] = [];
@@ -179,19 +193,33 @@ export class EvidenceDecisionEngine {
         const professional = records.filter((record) => record.type === "PROFESSIONAL_REVIEW" && record.productIdentityConfidence !== "LOW").length;
         const community = records.filter((record) => record.type === "COMMUNITY" && record.productIdentityConfidence !== "LOW").length;
         const positives = themes(records, positiveThemes), negatives = themes(records, negativeThemes);
-        const confidenceScore = clamp(30 + Math.min(25, official * 10) + Math.min(25, professional * 5) + Math.min(20, community * 2));
+        const semanticIdentity = meaningfulOverlap(need.label, candidate.title) && Boolean(candidate.sourceUrl);
+        const confidenceScore = clamp(30 + (identity.modelNumber ? 20 : 0) + (semanticIdentity ? 20 : 0) + Math.min(25, official * 10) + Math.min(20, professional * 4) + Math.min(10, community * 2));
         const quality = clamp(55 + Math.min(20, official * 8) + Math.min(15, professional * 4) + positives.length * 4 - negatives.length * 5);
         const reliability = clamp(50 + positives.length * 7 - negatives.length * 10 + Math.min(15, community));
-        return { candidate, records, identity, official, professional, community, positives, negatives, confidenceScore, quality, reliability };
+        const identityLevel: EvidenceConfidence = confidenceScore >= 75 ? "HIGH" : confidenceScore >= 50 ? "MEDIUM" : "LOW";
+        const capabilityChecks = assessCapabilities(spec, need, candidate, records.map((record) => ({ text: `${record.title} ${record.snippet ?? ""}`, source: record.sourceUrl ?? null })), official + professional + community);
+        const legacy = hardConstraints(need, candidate);
+        const failures = [...legacy.failures, ...capabilityChecks.filter((check) => check.hard && check.status === "MISMATCH").map((check) => check.capability)];
+        const unknowns = [...legacy.unknowns, ...capabilityChecks.filter((check) => check.hard && check.status === "CAPABILITY_UNKNOWN").map((check) => check.capability)];
+        const risks = priceIdentityRisk(candidate, shortlist, identityLevel);
+        return { candidate, records, identity, official, professional, community, positives, negatives, confidenceScore, identityLevel, quality, reliability, capabilityChecks, hard: { satisfied: failures.length === 0 && unknowns.length === 0, failures, unknowns }, risks };
       });
+      const numericCapabilityKeys = [...new Set(preliminary.flatMap((entry) => Object.entries(entry.candidate.attributes).filter(([key, value]) => key.startsWith("rated_") && typeof value === "number").map(([key]) => key)))];
+      const capabilityCeilings = new Map(numericCapabilityKeys.map((key) => [key, Math.max(...preliminary.map((entry) => typeof entry.candidate.attributes[key] === "number" ? entry.candidate.attributes[key] as number : 0))]));
       const ratios = preliminary.map((entry) => entry.quality / entry.candidate.pricePaise); const maxRatio = Math.max(...ratios);
       for (const [index, entry] of preliminary.entries()) {
-        const priceEfficiency = clamp(ratios[index] / maxRatio * 100); const requirementFit = 100;
-        const utility = clamp(requirementFit * weights.requirementFit + entry.quality * weights.productQuality + entry.reliability * weights.communityReliability + priceEfficiency * weights.priceEfficiency + entry.confidenceScore * weights.evidenceConfidence);
-        assessments.push({ offerSnapshotId: entry.candidate.id, needId: need.id, title: entry.candidate.title, currentPricePaise: entry.candidate.pricePaise * need.quantity, identity: entry.identity, identityConfidence: entry.confidenceScore >= 75 ? "HIGH" : entry.confidenceScore >= 50 ? "MEDIUM" : "LOW", hardConstraints: hardConstraints(need, entry.candidate), scores: { requirementFit, productQuality: entry.quality, communityReliability: entry.reliability, evidenceConfidence: entry.confidenceScore, priceEfficiency, utility }, evidenceCounts: { officialSources: entry.official, professionalSources: entry.professional, communityDiscussions: entry.community, merchantSources: 1 }, recurringPositives: entry.positives, recurringNegatives: entry.negatives, riskFlags: [...(entry.confidenceScore < 50 ? ["LOW_EVIDENCE_CONFIDENCE"] : []), ...(entry.negatives.length ? ["RECURRING_COMPLAINTS"] : [])] });
+        const priceEfficiency = clamp(ratios[index] / maxRatio * 100);
+        const hardChecks = entry.capabilityChecks.filter((check) => check.hard); const validChecks = hardChecks.filter((check) => check.status === "VALID").length;
+        const requirementFit = hardChecks.length ? clamp(validChecks / hardChecks.length * 100) : 100;
+        const capabilityStrength = numericCapabilityKeys.length ? numericCapabilityKeys.reduce((sum, key) => sum + (typeof entry.candidate.attributes[key] === "number" ? entry.candidate.attributes[key] as number : 0) / Math.max(1, capabilityCeilings.get(key) ?? 1), 0) / numericCapabilityKeys.length : 0;
+        const quality = clamp(entry.quality + capabilityStrength * 20);
+        const anomalyPenalty = entry.risks.includes("PRICE_ANOMALY") && !(entry.identityLevel === "HIGH" && entry.official >= 2) ? 25 : 0;
+        const utility = clamp(requirementFit * weights.requirementFit + quality * weights.productQuality + entry.reliability * weights.communityReliability + priceEfficiency * weights.priceEfficiency + entry.confidenceScore * weights.evidenceConfidence - anomalyPenalty);
+        assessments.push({ offerSnapshotId: entry.candidate.id, needId: need.id, title: entry.candidate.title, currentPricePaise: entry.candidate.pricePaise * need.quantity, identity: entry.identity, identityConfidence: entry.identityLevel, hardConstraints: entry.hard, capabilityChecks: entry.capabilityChecks, scores: { requirementFit, productQuality: quality, communityReliability: entry.reliability, evidenceConfidence: entry.confidenceScore, priceEfficiency, utility }, evidenceCounts: { officialSources: entry.official, professionalSources: entry.professional, communityDiscussions: entry.community, merchantSources: 1 }, recurringPositives: entry.positives, recurringNegatives: entry.negatives, riskFlags: [...entry.risks, ...(entry.confidenceScore < 50 ? ["LOW_EVIDENCE_CONFIDENCE"] : []), ...(entry.negatives.length ? ["RECURRING_COMPLAINTS"] : [])] });
       }
     }
-    const portfolios = optimizePortfolios(spec.needs.map((need) => assessments.filter((assessment) => assessment.needId === need.id).sort((a, b) => b.scores.utility - a.scores.utility)), spec.budgetPaise);
+    const portfolios = optimizePortfolios(spec.needs.map((need) => assessments.filter((assessment) => assessment.needId === need.id && assessment.hardConstraints.satisfied && (!live || assessment.identityConfidence !== "LOW") && !assessment.riskFlags.includes("VARIANT_AMBIGUOUS")).sort((a, b) => b.scores.utility - a.scores.utility).slice(0, 5)), spec.budgetPaise);
     const selectedPortfolio: PortfolioType = profile === "CHEAPEST" ? "CHEAPEST_VALID" : profile === "MAX_PERFORMANCE" ? "MAX_PERFORMANCE" : "BEST_VALUE";
     return { profile, weights, evidence, assessments, portfolios, selectedPortfolio };
   }

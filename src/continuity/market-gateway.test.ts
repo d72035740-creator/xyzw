@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
-import { MarketGateway, marketQueryFor, SerpApiLocalPlacesConnector, SerpApiShoppingConnector } from "./market-gateway";
+import { extractListingCapabilities, MarketGateway, marketQueryFor, SerpApiLocalPlacesConnector, SerpApiShoppingConnector } from "./market-gateway";
 
 const need = { id: "monitor", label: "144Hz monitor", kind: "PRODUCT" as const, quantity: 1, searchQueries: ["untrusted unrelated flowers query"], requiredAttributes: { refreshRateHz: 144 }, dependencies: [] };
 
 describe("SerpApiShoppingConnector", () => {
+  it("extracts generic rated and system capabilities from listing evidence", () => {
+    expect(extractListingCapabilities("Powered outdoor audio system 400 Watts IP65")).toMatchObject({ complete_system: true, outdoor_suitability: true, water_resistance: true, rated_w: 400 });
+    expect(extractListingCapabilities("12V 2A mini UPS power backup for router")).not.toHaveProperty("rated_power_output");
+  });
+
   it("normalizes only real price-backed shopping results", async () => {
     const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ shopping_results: [{ product_id: "p1", title: "Acer 24 inch 144Hz Monitor", source: "Example Store", extracted_price: 12499, product_link: "https://example.test/p1" }, { product_id: "p2", title: "No price", source: "Other Store" }] }), { status: 200 }));
     const offers = await new SerpApiShoppingConnector("test-key", fetcher).search(need, { missionId: "m" });
