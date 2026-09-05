@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { EvidenceDecisionEngine, EvidenceSearchConnector, inferDecisionProfile, optimizePortfolios, productIdentity, type CandidateAssessment } from "./evidence-engine";
+import { EvidenceDecisionEngine, EvidenceSearchConnector, SerperEvidenceSearchConnector, inferDecisionProfile, optimizePortfolios, productIdentity, type CandidateAssessment } from "./evidence-engine";
 import { validateMissionPortfolio } from "./capability-validator";
 import { extractListingCapabilities } from "./market-gateway";
 import type { MissionSpec } from "./types";
@@ -25,6 +25,14 @@ describe("EvidenceDecisionEngine", () => {
     await connector.search("LG 24GN650 official specifications");
     await connector.search("LG 24GN650 official specifications");
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses Serper Google Search without exposing its key", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ organic: [{ title: "Official specifications", link: "https://maker.test/specs", snippet: "Specs" }] }), { status: 200 }));
+    const results = await new SerperEvidenceSearchConnector("serper-key", fetcher).search("keyboard official specifications");
+    expect(fetcher.mock.calls[0][0]).toBe("https://google.serper.dev/search");
+    expect(results[0].link).toBe("https://maker.test/specs");
+    expect(JSON.stringify(results)).not.toContain("serper-key");
   });
 
   it("keeps close product variants separate", () => {

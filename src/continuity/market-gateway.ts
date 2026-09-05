@@ -132,6 +132,41 @@ export class SerpApiShoppingConnector implements MarketConnector {
   }
 }
 
+type SerperShoppingResult = { title?: string; source?: string; link?: string; price?: string | number; rating?: number; ratingCount?: number; productId?: string; delivery?: string; imageUrl?: string };
+
+export class SerperShoppingConnector implements MarketConnector {
+  readonly connectorId = "serper-google-shopping";
+  constructor(private readonly apiKey = process.env.SERPER_API_KEY ?? "", private readonly fetcher: typeof fetch = fetch) {}
+  supports(need: MissionNeed) { return need.kind === "PRODUCT" || need.kind === "OTHER_COMMERCE"; }
+
+  async search(need: MissionNeed, context: MarketSearchContext) {
+    if (!this.apiKey) throw new ContinuityError("LIVE_MARKET_CONFIGURATION_MISSING", "SERPER_API_KEY is required when the Serper market provider is selected", 503);
+    const query = marketQueryFor(need, context); const startedAt = Date.now(); let response: Response;
+    try { response = await this.fetcher("https://google.serper.dev/shopping", { method: "POST", headers: { "X-API-KEY": this.apiKey, "Content-Type": "application/json" }, body: JSON.stringify({ q: query, gl: "in", hl: "en" }), signal: AbortSignal.timeout(SHOPPING_TIMEOUT_MS) }); }
+    catch (error) { marketDiagnostic("SHOPPING_REQUEST_END", { provider: "serper", query, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    if (!response.ok) { marketDiagnostic("SHOPPING_REQUEST_END", { provider: "serper", query, httpStatus: response.status, elapsedMs: Date.now() - startedAt }); throw new ContinuityError("LIVE_MARKET_PROVIDER_FAILED", "Live shopping search failed", 502, { providerStatus: response.status }); }
+    const body = await response.json() as { shopping?: SerperShoppingResult[] }; const shoppingResults = body.shopping ?? []; let rejectedPrice = 0;
+    const offers = shoppingResults.flatMap((item, index): MarketOffer[] => {
+      const pricePaise = parseShoppingPricePaise(item.price);
+      if (!item.title || !item.source || pricePaise === null) { rejectedPrice++; return []; }
+      const externalId = item.productId ?? `${query}-${index}`; const observedAt = new Date().toISOString();
+      const deliverySupported = Boolean(item.delivery && context.locationLabel && !/\b(?:not available|unavailable|cannot|can't|no delivery)\b/i.test(item.delivery));
+      const lower = item.title.toLowerCase(); const attributes: Record<string, unknown> = { ...extractListingCapabilities(item.title), extraction: "listing-title-evidence", delivery: item.delivery ?? null, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN" };
+      for (const [key, expected] of Object.entries(need.requiredAttributes)) {
+        if (key === "refreshRateHz") { const hz = lower.match(/(\d{2,3})\s*hz/); if (hz) attributes[key] = Number(hz[1]); }
+        else if (typeof expected === "boolean" && expected && lower.includes(key.toLowerCase())) attributes[key] = true;
+        else if (typeof expected === "string" && lower.includes(expected.toLowerCase())) attributes[key] = expected;
+      }
+      return [{ id: randomUUID(), needId: need.id, source: { provider: this.connectorId, externalId, url: item.link }, merchant: { name: item.source }, title: item.title, pricePaise, currency: "INR", availability: "UNKNOWN", observedAt, sourceVersion: version([externalId, pricePaise, item.source, item.title, observedAt]), attributes, evidence: { title: item.title, sourceUrl: item.link, locationLabel: context.locationLabel, deliveryText: item.delivery, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN", pricingStatus: "KNOWN", rating: item.rating }, reversibility: { type: "UNKNOWN" } }];
+    }).slice(0, 5);
+    marketDiagnostic("SHOPPING_REQUEST_END", { provider: "serper", query, httpStatus: response.status, resultsCount: shoppingResults.length, elapsedMs: Date.now() - startedAt });
+    marketDiagnostic("SHOPPING_CANDIDATE_COUNTS", { needId: need.id, shoppingResultsReturned: shoppingResults.length, candidatesWithParsedPrice: offers.length, candidatesRejectedPrice: rejectedPrice });
+    return offers;
+  }
+
+  async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) { return (await this.search(need, context)).find((candidate) => candidate.source.externalId === offer.source.externalId) ?? null; }
+}
+
 type SerpLocalResult = {
   place_id?: string; data_id?: string; title?: string; rating?: number; reviews?: number; address?: string;
   price?: string; type?: string; description?: string; website?: string; place_id_search?: string;
@@ -208,7 +243,8 @@ export class MarketGateway {
 
   constructor(mode = (process.env.MISSIONPAY_MARKET_MODE ?? "sandbox") as "live" | "sandbox", connectors?: MarketConnector[]) {
     this.mode = mode;
-    this.connectors = connectors ?? (mode === "live" ? [new SerpApiShoppingConnector(), new SerpApiLocalPlacesConnector()] : [new SandboxShoppingConnector()]);
+    const provider = process.env.MISSIONPAY_MARKET_PROVIDER ?? "serpapi";
+    this.connectors = connectors ?? (mode === "live" ? provider === "serper" ? [new SerperShoppingConnector()] : [new SerpApiShoppingConnector(), new SerpApiLocalPlacesConnector()] : [new SandboxShoppingConnector()]);
   }
 
   private connectorFor(need: MissionNeed) { return this.connectors.find((connector) => connector.supports(need)); }

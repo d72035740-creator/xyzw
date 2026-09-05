@@ -76,6 +76,25 @@ export class EvidenceSearchConnector {
   }
 }
 
+export class SerperEvidenceSearchConnector extends EvidenceSearchConnector {
+  private readonly serperCache = new Map<string, { expiresAt: number; results: SearchEvidence[] }>();
+  constructor(private readonly serperApiKey = process.env.SERPER_API_KEY ?? "", private readonly serperFetcher: typeof fetch = fetch) { super("", serperFetcher); }
+  override async search(query: string): Promise<SearchEvidence[]> {
+    if (!this.serperApiKey) throw new ContinuityError("EVIDENCE_CONFIGURATION_MISSING", "SERPER_API_KEY is required when the Serper market provider is selected", 503);
+    const cached = this.serperCache.get(query); if (cached && cached.expiresAt > Date.now()) return cached.results;
+    const startedAt = Date.now(); let response: Response;
+    try { response = await this.serperFetcher("https://google.serper.dev/search", { method: "POST", headers: { "X-API-KEY": this.serperApiKey, "Content-Type": "application/json" }, body: JSON.stringify({ q: query, gl: "in", hl: "en", num: 5 }), signal: AbortSignal.timeout(EVIDENCE_TIMEOUT_MS) }); }
+    catch (error) { evidenceDiagnostic("EVIDENCE_REQUEST_END", { provider: "serper", elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    evidenceDiagnostic("EVIDENCE_REQUEST_END", { provider: "serper", httpStatus: response.status, elapsedMs: Date.now() - startedAt });
+    if (!response.ok) throw new ContinuityError("EVIDENCE_SEARCH_FAILED", "Evidence search failed", 502, { providerStatus: response.status });
+    const body = await response.json() as { organic?: SearchEvidence[] };
+    const results = (body.organic ?? []).filter((result) => result.title).slice(0, 5); const ttlMs = /official specifications/i.test(query) ? 7 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    this.serperCache.set(query, { expiresAt: Date.now() + ttlMs, results }); return results;
+  }
+}
+
+function defaultEvidenceConnector() { return process.env.MISSIONPAY_MARKET_PROVIDER === "serper" ? new SerperEvidenceSearchConnector() : new EvidenceSearchConnector(); }
+
 const clamp = (value: number) => Math.max(0, Math.min(100, Math.round(value)));
 const modelPattern = /\b\d{2,}[A-Z][A-Z0-9-]*\b/i;
 const sizePattern = /\b\d{2,3}(?:\.\d+)?\s*(?:inch|inches|\")\b/i;
@@ -170,7 +189,7 @@ export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise:
 }
 
 export class EvidenceDecisionEngine {
-  constructor(private readonly connector = new EvidenceSearchConnector()) {}
+  constructor(private readonly connector = defaultEvidenceConnector()) {}
 
   async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
     const { profile, weights } = inferDecisionProfile(spec.goal, spec.optimizationIntent);

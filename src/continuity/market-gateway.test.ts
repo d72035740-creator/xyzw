@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { extractListingCapabilities, MarketGateway, marketQueryFor, parseShoppingPricePaise, SerpApiLocalPlacesConnector, SerpApiShoppingConnector } from "./market-gateway";
+import { extractListingCapabilities, MarketGateway, marketQueryFor, parseShoppingPricePaise, SerpApiLocalPlacesConnector, SerpApiShoppingConnector, SerperShoppingConnector } from "./market-gateway";
 
 const need = { id: "monitor", label: "144Hz monitor", kind: "PRODUCT" as const, quantity: 1, searchQueries: ["untrusted unrelated flowers query"], requiredAttributes: { refreshRateHz: 144 }, dependencies: [] };
 
@@ -24,6 +24,13 @@ describe("SerpApiShoppingConnector", () => {
     expect(offers).toHaveLength(1);
     expect(offers[0]).toMatchObject({ pricePaise: 1_249_900, merchant: { name: "Example Store" }, source: { externalId: "p1", url: "https://example.test/p1" }, attributes: { refreshRateHz: 144 } });
     expect(JSON.stringify(offers)).not.toContain("test-key");
+  });
+
+  it("normalizes Serper Shopping prices into the existing offer shape", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ shopping: [{ productId: "serper-1", title: "Mechanical Gaming Keyboard", source: "Example Store", price: "₹1,299", link: "https://example.test/keyboard", rating: 4.5, ratingCount: 42 }] }), { status: 200 }));
+    const [offer] = await new SerperShoppingConnector("serper-key", fetcher).search({ ...need, id: "keyboard", label: "Mechanical keyboard", requiredAttributes: { mechanical: true } }, { missionId: "m" });
+    expect(offer).toMatchObject({ pricePaise: 129_900, source: { provider: "serper-google-shopping", externalId: "serper-1", url: "https://example.test/keyboard" }, attributes: { mechanical: true } });
+    expect(JSON.stringify(offer)).not.toContain("serper-key");
   });
 
   it("uses the resolved label in query and provider location without inventing delivery evidence", async () => {
