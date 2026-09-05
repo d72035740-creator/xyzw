@@ -172,6 +172,30 @@ export class SerperShoppingConnector implements MarketConnector {
   async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) { return (await this.search(need, context)).find((candidate) => candidate.source.externalId === offer.source.externalId) ?? null; }
 }
 
+type SerperPlaceResult = { title?: string; address?: string; latitude?: number; longitude?: number; rating?: number; ratingCount?: number; category?: string; website?: string; phoneNumber?: string; cid?: string; placeId?: string; description?: string };
+
+export class SerperPlacesConnector implements MarketConnector {
+  readonly connectorId = "serper-places";
+  constructor(private readonly apiKey = process.env.SERPER_API_KEY ?? "", private readonly fetcher: typeof fetch = fetch) {}
+  supports(need: MissionNeed) { return need.kind === "RESTAURANT" || need.kind === "LOCAL_SERVICE"; }
+  async search(need: MissionNeed, context: MarketSearchContext) {
+    if (!this.apiKey) throw new ContinuityError("LIVE_MARKET_CONFIGURATION_MISSING", "SERPER_API_KEY is required when the Serper market provider is selected", 503);
+    if (!context.locationLabel) throw new ContinuityError("NO_SUPPORTED_MARKET_SOURCE", `${need.label} requires a target location for local search`, 422, { needId: need.id });
+    const query = marketQueryFor(need, context); const startedAt = Date.now(); let response: Response;
+    try { response = await this.fetcher("https://google.serper.dev/places", { method: "POST", headers: { "X-API-KEY": this.apiKey, "Content-Type": "application/json" }, body: JSON.stringify({ q: query, gl: "in", hl: "en", location: context.locationLabel }), signal: AbortSignal.timeout(SHOPPING_TIMEOUT_MS) }); }
+    catch (error) { marketDiagnostic("LOCAL_REQUEST_END", { provider: "serper", query, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    if (!response.ok) throw new ContinuityError("LIVE_MARKET_PROVIDER_FAILED", "Live local search failed", 502, { providerStatus: response.status });
+    const body = await response.json() as { places?: SerperPlaceResult[] }; const places = body.places ?? [];
+    const offers = places.flatMap((item, index): MarketOffer[] => {
+      if (!item.title) return []; const externalId = item.placeId ?? item.cid ?? `${query}-${index}`; const observedAt = new Date().toISOString();
+      return [{ id: randomUUID(), needId: need.id, source: { provider: this.connectorId, externalId, url: item.website }, merchant: { name: item.title, location: item.address }, title: item.title, description: item.description, pricePaise: null, currency: "INR", availability: "UNKNOWN", observedAt, sourceVersion: version([externalId, item.title, item.address, item.rating, item.ratingCount, observedAt]), attributes: { type: item.category ?? null, rating: item.rating ?? null, reviewCount: item.ratingCount ?? null, address: item.address ?? null, latitude: item.latitude ?? null, longitude: item.longitude ?? null }, evidence: { title: item.title, snippet: item.description, sourceUrl: item.website, locationLabel: context.locationLabel, locationCompatibility: "SUPPORTED_EVIDENCE", rating: item.rating, reviewCount: item.ratingCount, address: item.address, pricingStatus: "UNKNOWN" }, reversibility: { type: "UNKNOWN" } }];
+    }).slice(0, 10);
+    marketDiagnostic("LOCAL_REQUEST_END", { provider: "serper", query, httpStatus: response.status, resultsCount: offers.length, elapsedMs: Date.now() - startedAt });
+    return offers;
+  }
+  async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) { return (await this.search(need, context)).find((candidate) => candidate.source.externalId === offer.source.externalId) ?? null; }
+}
+
 type SerpLocalResult = {
   place_id?: string; data_id?: string; title?: string; rating?: number; reviews?: number; address?: string;
   price?: string; type?: string; description?: string; website?: string; place_id_search?: string;
@@ -249,7 +273,7 @@ export class MarketGateway {
   constructor(mode = (process.env.MISSIONPAY_MARKET_MODE ?? "sandbox") as "live" | "sandbox", connectors?: MarketConnector[]) {
     this.mode = mode;
     const provider = process.env.MISSIONPAY_MARKET_PROVIDER ?? "serpapi";
-    this.connectors = connectors ?? (mode === "live" ? provider === "serper" ? [new SerperShoppingConnector()] : [new SerpApiShoppingConnector(), new SerpApiLocalPlacesConnector()] : [new SandboxShoppingConnector()]);
+    this.connectors = connectors ?? (mode === "live" ? provider === "serper" ? [new SerperShoppingConnector(), new SerperPlacesConnector()] : [new SerpApiShoppingConnector(), new SerpApiLocalPlacesConnector()] : [new SandboxShoppingConnector()]);
   }
 
   private connectorFor(need: MissionNeed) { return this.connectors.find((connector) => connector.supports(need)); }

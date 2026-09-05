@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { extractListingCapabilities, MarketGateway, marketQueryFor, parseShoppingPricePaise, SerpApiLocalPlacesConnector, SerpApiShoppingConnector, SerperShoppingConnector } from "./market-gateway";
+import { extractListingCapabilities, MarketGateway, marketQueryFor, parseShoppingPricePaise, SerpApiLocalPlacesConnector, SerpApiShoppingConnector, SerperPlacesConnector, SerperShoppingConnector } from "./market-gateway";
 
 const need = { id: "monitor", label: "144Hz monitor", kind: "PRODUCT" as const, quantity: 1, searchQueries: ["untrusted unrelated flowers query"], requiredAttributes: { refreshRateHz: 144 }, dependencies: [] };
 
@@ -70,6 +70,14 @@ describe("SerpApiShoppingConnector", () => {
     expect(offer).toMatchObject({ title: "Varanasi Dining Room", pricePaise: null, evidence: { rating: 4.6, reviewCount: 321, address: "Bhelupur, Varanasi", priceText: "₹₹", pricingStatus: "UNKNOWN" } });
     const [result] = await new MarketGateway("live", [connector]).search([restaurant], { missionId: "m", locationLabel: "Varanasi" });
     expect(result.error).toMatchObject({ code: "INSUFFICIENT_PRICING_EVIDENCE" });
+  });
+
+  it("routes restaurants through Serper Places without fabricating a price", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ places: [{ placeId: "place-1", title: "Varanasi Vegetarian Kitchen", address: "Bhelupur, Varanasi", rating: 4.7, ratingCount: 421, category: "Vegetarian restaurant", website: "https://restaurant.test" }] }), { status: 200 }));
+    const restaurant = { ...need, id: "dining", kind: "RESTAURANT" as const, label: "Vegetarian dinner", requiredAttributes: {} };
+    const [offer] = await new SerperPlacesConnector("serper-key", fetcher).search(restaurant, { missionId: "m", locationLabel: "Varanasi" });
+    expect(fetcher.mock.calls[0][0]).toBe("https://google.serper.dev/places");
+    expect(offer).toMatchObject({ pricePaise: null, source: { provider: "serper-places", externalId: "place-1" }, evidence: { pricingStatus: "UNKNOWN", rating: 4.7, reviewCount: 421 } });
   });
 
   it("returns NO_SUPPORTED_MARKET_SOURCE instead of substituting another category", async () => {
