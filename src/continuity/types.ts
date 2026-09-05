@@ -62,7 +62,16 @@ export class ContinuityError extends Error {
   constructor(public readonly code: string, message: string, public readonly status = 400, public readonly details?: Record<string, unknown>) { super(message); }
 }
 export function continuityErrorResponse(error: unknown) {
-  if (error instanceof ContinuityError) return Response.json({ error: { code: error.code, message: error.message, details: error.details } }, { status: error.status });
+  if (error instanceof ContinuityError) {
+    console.error(`[CONTINUITY_ERROR] status=${error.status} code=${error.code} message=${error.message}`, {
+      code: error.code,
+      status: error.status,
+      message: error.message,
+      details: error.details,
+    });
+    return Response.json({ error: { code: error.code, message: error.message, details: error.details } }, { status: error.status });
+  }
+  console.error("[CONTINUITY_ERROR] unhandled error", error);
   return Response.json({ error: { code: "CONTINUITY_ERROR", message: "Mission continuity operation failed" } }, { status: 500 });
 }
 

@@ -86,7 +86,7 @@ export function ContinuityApp() {
   }
   async function build() {
     if (!understanding) return;
-    await run("SEARCHING MARKET · RESEARCHING EVIDENCE · OPTIMIZING AUTHORITY", async () => setView(await request<View>("/api/continuity/missions", { method: "POST", body: JSON.stringify({ missionId: understanding.missionId, missionVersion: understanding.missionVersion }) })));
+    await run("SEARCHING MARKET · RESEARCHING EVIDENCE · OPTIMIZING AUTHORITY", async () => setView(await request<View>(`/api/continuity/missions/${understanding.missionId}/market`, { method: "POST", body: JSON.stringify({ missionVersion: understanding.missionVersion }) })));
   }
   function useCurrentLocation() {
     if (locationRequested) return;
