@@ -61,9 +61,20 @@ export function marketQueryFor(need: MissionNeed, context: MarketSearchContext) 
 }
 
 type SerpShoppingResult = {
-  product_id?: string; title?: string; source?: string; extracted_price?: number;
+  product_id?: string; title?: string; source?: string; extracted_price?: number | string; price?: string;
   product_link?: string; link?: string; snippet?: string; delivery?: string;
 };
+
+export function parseShoppingPricePaise(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : null;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (!normalized || /(?:-|–|—|to)\s*(?:₹|rs\.?|inr)?\s*\d/i.test(normalized) || /(?:starting|from)\s+(?:₹|rs\.?|inr)?\s*\d/i.test(normalized)) return null;
+  const match = normalized.match(/^(?:₹\s*|rs\.?\s*|inr\s*)?(\d{1,3}(?:,\d{2,3})+|\d+)(?:\.\d{1,2})?$/i);
+  if (!match) return null;
+  const rupees = Number(match[1].replaceAll(",", ""));
+  return Number.isFinite(rupees) && rupees > 0 && rupees < 10_000_000 ? Math.round(rupees * 100) : null;
+}
 
 export class SerpApiShoppingConnector implements MarketConnector {
   readonly connectorId = "serpapi-google-shopping";
@@ -87,9 +98,11 @@ export class SerpApiShoppingConnector implements MarketConnector {
     marketDiagnostic("SHOPPING_REQUEST_END", { provider: this.connectorId, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
     if (!response.ok) throw new ContinuityError("LIVE_MARKET_PROVIDER_FAILED", "Live shopping search failed", 502, { providerStatus: response.status });
     const body = await response.json() as { shopping_results?: SerpShoppingResult[] };
-    return (body.shopping_results ?? []).flatMap((item, index): MarketOffer[] => {
-      if (!item.title || !item.source || !Number.isFinite(item.extracted_price) || item.extracted_price! <= 0) return [];
-      const pricePaise = Math.round(item.extracted_price! * 100);
+    const shoppingResults = body.shopping_results ?? [];
+    let rejectedPrice = 0;
+    const offers = shoppingResults.flatMap((item, index): MarketOffer[] => {
+      const pricePaise = parseShoppingPricePaise(item.extracted_price ?? item.price);
+      if (!item.title || !item.source || pricePaise === null) { rejectedPrice++; return []; }
       const externalId = item.product_id ?? `${query}-${index}`;
       const observedAt = new Date().toISOString();
       const sourceUrl = item.product_link ?? item.link;
@@ -109,6 +122,8 @@ export class SerpApiShoppingConnector implements MarketConnector {
         reversibility: { type: "UNKNOWN" },
       }];
     }).slice(0, 5);
+    marketDiagnostic("SHOPPING_CANDIDATE_COUNTS", { needId: need.id, shoppingResultsReturned: shoppingResults.length, candidatesWithParsedPrice: offers.length, candidatesRejectedPrice: rejectedPrice });
+    return offers;
   }
 
   async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) {

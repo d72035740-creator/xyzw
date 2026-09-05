@@ -74,6 +74,7 @@ export class ContinuityService {
       let decision;
       marketDiagnostic("EVIDENCE_REQUEST_START",{elapsedMs:Date.now()-marketStartedAt});
       try { decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live"); } catch(error) { throw evidenceStageError(error); }
+      for(const need of spec.needs){const group=groups.find(item=>item.need.id===need.id);const priced=group?.offers.filter(hasKnownPrice)??[];const assessments=decision.assessments.filter(item=>item.needId===need.id);marketDiagnostic("PRICE_BACKED_CANDIDATE_COUNTS",{needId:need.id,shoppingResultsReturned:group?.offers.length??0,candidatesWithParsedPrice:priced.length,candidatesRejectedIdentity:assessments.filter(item=>item.identityConfidence==="LOW"||item.riskFlags.includes("VARIANT_AMBIGUOUS")).length,candidatesRejectedCapability:assessments.filter(item=>!item.hardConstraints.satisfied).length,candidatesRejectedPrice:0,candidatesRemaining:assessments.filter(item=>item.identityConfidence!=="LOW"&&!item.riskFlags.includes("VARIANT_AMBIGUOUS")&&item.hardConstraints.satisfied).length});}
       marketDiagnostic("CAPABILITY_VALIDATION",{elapsedMs:Date.now()-marketStartedAt,assessmentCount:decision.assessments.length});
       const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
       if(!chosen)throw new ContinuityError("PORTFOLIO_NOT_MISSION_VALID","Selected portfolio was not produced",409);

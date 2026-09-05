@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
-import { extractListingCapabilities, MarketGateway, marketQueryFor, SerpApiLocalPlacesConnector, SerpApiShoppingConnector } from "./market-gateway";
+import { extractListingCapabilities, MarketGateway, marketQueryFor, parseShoppingPricePaise, SerpApiLocalPlacesConnector, SerpApiShoppingConnector } from "./market-gateway";
 
 const need = { id: "monitor", label: "144Hz monitor", kind: "PRODUCT" as const, quantity: 1, searchQueries: ["untrusted unrelated flowers query"], requiredAttributes: { refreshRateHz: 144 }, dependencies: [] };
 
 describe("SerpApiShoppingConnector", () => {
+  it.each([["₹1,299", 129_900], ["₹ 1,299", 129_900], ["Rs. 1,299", 129_900], ["INR 1299", 129_900], ["1,299", 129_900]])("parses an exact Indian Shopping price: %s", (price, expected) => {
+    expect(parseShoppingPricePaise(price)).toBe(expected);
+  });
+
+  it("rejects Shopping price ranges and malformed values", () => {
+    expect(parseShoppingPricePaise("₹1,299 - ₹1,999")).toBeNull();
+    expect(parseShoppingPricePaise("starting at ₹1,299")).toBeNull();
+    expect(parseShoppingPricePaise("price on request")).toBeNull();
+  });
   it("extracts generic rated and system capabilities from listing evidence", () => {
     expect(extractListingCapabilities("Powered outdoor audio system 400 Watts IP65")).toMatchObject({ complete_system: true, outdoor_suitability: true, water_resistance: true, rated_w: 400 });
     expect(extractListingCapabilities("12V 2A mini UPS power backup for router")).not.toHaveProperty("rated_power_output");
