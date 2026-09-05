@@ -71,6 +71,13 @@
       "when": 1788531835487,
       "tag": "0009_strange_micromacro",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788531835488,
+      "tag": "0010_persist_valid_mission_compilations",
+      "breakpoints": true
     }
   ]
 }

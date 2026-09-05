@@ -2,6 +2,7 @@ import { and, desc, eq, inArray, ne } from "drizzle-orm";
 import { db, type Database } from "@/db/client";
 import { candidateAssessments, continuityMissions, continuityRepairAttempts, continuityRepairPaymentOrders, continuitySelections, decisionRuns, marketOfferSnapshots, marketSearches, missionEvents, missionOutcomeEvents, missionPaymentOrders, missions, productEvidence } from "@/db/schema";
 import { MissionCompiler } from "./mission-compiler";
+import { PostgresMissionCompilationCache } from "./mission-compilation-cache";
 import { hasKnownPrice, MarketGateway, marketQueryFor } from "./market-gateway";
 import { ContinuityError, missionSpecSchema, type MarketOffer, type MissionLocationInput, type MissionNeed } from "./types";
 import { EvidenceDecisionEngine, type DecisionPortfolio } from "./evidence-engine";
@@ -41,7 +42,7 @@ function evidenceStageError(error: unknown) {
 }
 
 export class ContinuityService {
-  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler(),private readonly decisionEngine=new EvidenceDecisionEngine(),private readonly marketGatewayFactory:MarketGatewayFactory=(mode)=>new MarketGateway(mode)){}
+  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler(undefined, console, undefined, new PostgresMissionCompilationCache(database)),private readonly decisionEngine=new EvidenceDecisionEngine(),private readonly marketGatewayFactory:MarketGatewayFactory=(mode)=>new MarketGateway(mode)){}
   async understand(input:MissionUnderstandingInput) {
     const spec = await this.compiler.compile(input);
     const gateway = this.marketGatewayFactory();

@@ -325,6 +325,26 @@ export const continuityMissions = pgTable("continuity_missions", {
   check("continuity_market_mode_valid", sql`${table.marketMode} IN ('live', 'sandbox')`),
 ]);
 
+// Validated semantic input only; this is deliberately separate from all mission,
+// market, and payment execution state.
+export const missionCompilationCache = pgTable("mission_compilation_cache", {
+  cacheKey: text("cache_key").primaryKey(),
+  normalizedGoal: text("normalized_goal").notNull(),
+  maximumAuthorityPaise: integer("maximum_authority_paise").notNull(),
+  repairAllowancePaise: integer("repair_allowance_paise").notNull(),
+  resolvedLocation: text("resolved_location"),
+  missionSpec: jsonb("mission_spec").$type<Record<string, unknown>>().notNull(),
+  compilerProvider: text("compiler_provider").notNull(),
+  compilerModel: text("compiler_model").notNull(),
+  semanticValidationStatus: text("semantic_validation_status").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("mission_compilation_cache_created_idx").on(table.createdAt),
+  check("mission_compilation_cache_authority_positive", sql`${table.maximumAuthorityPaise} > 0`),
+  check("mission_compilation_cache_repair_nonnegative", sql`${table.repairAllowancePaise} >= 0`),
+  check("mission_compilation_cache_semantic_valid", sql`${table.semanticValidationStatus} = 'VALID'`),
+]);
+
 export const marketSearches = pgTable("market_searches", {
   id: uuid("id").primaryKey().defaultRandom(),
   missionId: uuid("mission_id").notNull().references(() => missions.id),

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MISSION_SPEC_JSON_SCHEMA, MissionCompiler } from "./mission-compiler";
+import type { CachedMissionCompilation, MissionCompilationCache } from "./mission-compilation-cache";
 import { inspectMissionNeeds } from "./mission-semantic-validator";
 import { missionLocationInputSchema } from "./types";
 
@@ -32,6 +33,11 @@ function groqCompiler(outputs: unknown[], logger = { info: vi.fn() }) {
   const fetcher = vi.fn();
   for (const output of outputs) fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: typeof output === "string" ? output : JSON.stringify(output) } }] }), { status: 200 }));
   return { compiler: new MissionCompiler(fetcher as typeof fetch, logger, async () => {}), fetcher, logger };
+}
+class MemoryCompilationCache implements MissionCompilationCache {
+  readonly entries = new Map<string, CachedMissionCompilation>();
+  async getValid(cacheKey: string) { return this.entries.get(cacheKey) ?? null; }
+  async putValid(entry: CachedMissionCompilation) { this.entries.set(entry.cacheKey, entry); }
 }
 function assertStrictObjectSchema(value: unknown, path = "root") {
   if (!value || typeof value !== "object") return;
@@ -274,6 +280,47 @@ describe("MissionCompiler", () => {
     for (const unsupported of ["store", "truncation", "include", "previous_response_id", "safety_identifier", "prompt_cache_key", "prompt", "text", "instructions", "input"]) expect(body[unsupported]).toBeUndefined();
     expect(body.response_format.json_schema.schema.required).toContain("needs");
     expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_DIAGNOSTIC", expect.objectContaining({ compilerProvider: "groq", modelId: "openai/gpt-oss-120b", validationResult: "VALID" }));
+  });
+
+  it("persists only a validated live AI compilation and serves it through a Groq outage", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-20b");
+    const goal = "Plan a vegetarian dinner for two in Varanasi tonight at 8 PM under ₹5,000. Optimize for best value.";
+    const valid = modelSpec(goal, 500_000, [{ id: "dinner", label: "Vegetarian restaurant dinner", kind: "RESTAURANT", explicit: true, sourcePhrase: "vegetarian dinner" }], [{ label: "diners", count: 2, role: "participant" }]);
+    const cache = new MemoryCompilationCache();
+    const successfulFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(valid) } }] }), { status: 200 }));
+    const first = new MissionCompiler(successfulFetcher as typeof fetch, { info: vi.fn() }, async () => {}, cache);
+    await expect(first.compile({ goal, maximumAuthorityPaise: 500_000, repairAllowancePaise: 0 })).resolves.toMatchObject({ budgetPaise: 500_000 });
+    expect(cache.entries).toHaveLength(1);
+
+    const unavailableFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { code: "temporarily_unavailable" } }), { status: 503 }));
+    const logger = { info: vi.fn() };
+    const cached = new MissionCompiler(unavailableFetcher as typeof fetch, logger, async () => {}, cache);
+    await expect(cached.compile({ goal: `  ${goal.replace(/ /g, "   ")} `, maximumAuthorityPaise: 500_000, repairAllowancePaise: 0 })).resolves.toMatchObject({ needs: [expect.objectContaining({ id: "dinner" })] });
+    expect(unavailableFetcher).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_CACHE_HIT", expect.objectContaining({ compilerSource: "CACHED_AI_COMPILATION" }));
+  });
+
+  it("checks the validated cache again after both transient Groq attempts fail", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-20b");
+    const goal = "Buy flowers under ₹1,000";
+    const valid = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
+    const entry: CachedMissionCompilation = { cacheKey: "cache-key", normalizedGoal: goal.toLowerCase(), maximumAuthorityPaise: 100_000, repairAllowancePaise: 0, resolvedLocation: null, missionSpec: valid as never, compilerProvider: "groq", compilerModel: "openai/gpt-oss-20b", createdAt: new Date() };
+    const cache: MissionCompilationCache = { getValid: vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(entry), putValid: vi.fn() };
+    const failure = () => new Response(JSON.stringify({ error: { code: "temporarily_unavailable" } }), { status: 503 });
+    const fetcher = vi.fn().mockResolvedValueOnce(failure()).mockResolvedValueOnce(failure());
+    const compiler = new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }, async () => {}, cache);
+    await expect(compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).resolves.toMatchObject({ budgetPaise: 100_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not cache a semantic-invalid provider output", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-20b");
+    const cache = new MemoryCompilationCache();
+    const invalid = modelSpec("Plan an evening with my girlfriend.", 100_000, []);
+    const fetcher = vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(invalid) } }] }), { status: 200 })));
+    const compiler = new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }, async () => {}, cache);
+    await expect(compiler.compile({ goal: "Plan an evening with my girlfriend.", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_SEMANTIC_INVALID" });
+    expect(cache.entries).toHaveLength(0);
   });
 
   it("parses only Chat Completions message content", async () => {

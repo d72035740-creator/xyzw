@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { NoopMissionCompilationCache, type MissionCompilationCache } from "./mission-compilation-cache";
 import { inspectMissionNeeds, validateMissionNeeds } from "./mission-semantic-validator";
 import { ContinuityError, missionSpecSchema, type MissionLocation, type MissionLocationInput, type MissionSpec } from "./types";
 
@@ -172,6 +173,22 @@ export const MISSION_SPEC_JSON_SCHEMA = {
   },
 } as const;
 
+export function missionCompilationCacheKey(input: {
+  goal: string;
+  maximumAuthorityPaise: number;
+  repairAllowancePaise: number;
+  resolvedLocation?: string;
+}) {
+  // Deliberately limited to superficial normalization; user intent is not rewritten.
+  const normalize = (value: string) => value.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+  return createHash("sha256").update(JSON.stringify({
+    goal: normalize(input.goal),
+    maximumAuthorityPaise: input.maximumAuthorityPaise,
+    repairAllowancePaise: input.repairAllowancePaise,
+    resolvedLocation: input.resolvedLocation ? normalize(input.resolvedLocation) : null,
+  })).digest("hex");
+}
+
 function sanitizeProviderMessage(value: unknown, apiKey: string) {
   if (typeof value !== "string") return null;
   return value
@@ -223,6 +240,7 @@ export class MissionCompiler {
     private readonly fetcher: typeof fetch = fetch,
     private readonly logger: DiagnosticLogger = console,
     private readonly sleep: (milliseconds: number) => Promise<void> = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    private readonly compilationCache: MissionCompilationCache = new NoopMissionCompilationCache(),
   ) {}
 
   async compile(input: CompilerInput): Promise<MissionSpec> {
@@ -232,9 +250,52 @@ export class MissionCompiler {
     if (!budgetPaise) throw new ContinuityError("BUDGET_REQUIRED", "Add a maximum authority or include a budget in the mission.");
     const location = resolveMissionLocation(input.goal, input.location);
     const provider = process.env.MISSIONPAY_PLANNER_PROVIDER ?? "mock";
-    if (provider === "openai" || provider === "groq") return this.compileWithProvider({ ...input, location, maximumAuthorityPaise: budgetPaise }, provider);
+    if (provider === "openai" || provider === "groq") {
+      const providerInput = { ...input, location, maximumAuthorityPaise: budgetPaise };
+      const repairAllowancePaise = input.repairAllowancePaise ?? 0;
+      const normalizedGoal = input.goal.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+      const resolvedLocation = location?.label.trim() || null;
+      const cacheKey = missionCompilationCacheKey({ goal: input.goal, maximumAuthorityPaise: budgetPaise, repairAllowancePaise, resolvedLocation: resolvedLocation ?? undefined });
+      const cached = await this.readValidCachedCompilation(cacheKey, providerInput);
+      if (cached) return cached;
+      try {
+        const spec = await this.compileWithProvider(providerInput, provider);
+        await this.writeValidCachedCompilation({ cacheKey, normalizedGoal, maximumAuthorityPaise: budgetPaise, repairAllowancePaise, resolvedLocation, missionSpec: spec, compilerProvider: provider, compilerModel: this.providerConfig(provider).model, createdAt: new Date() });
+        return spec;
+      } catch (error) {
+        if (!(error instanceof ContinuityError) || error.code !== "MISSION_COMPILER_UNAVAILABLE") throw error;
+        const fallback = await this.readValidCachedCompilation(cacheKey, providerInput);
+        if (fallback) return fallback;
+        throw error;
+      }
+    }
     if (provider === "mock") return compileMock(input.goal, budgetPaise, location, input.repairAllowancePaise ?? 0);
     throw new ContinuityError("MISSION_COMPILER_UNAVAILABLE", "Configured mission compiler provider is unavailable.", 503);
+  }
+
+  private async readValidCachedCompilation(cacheKey: string, input: ProviderCompilerInput): Promise<MissionSpec | null> {
+    try {
+      const cached = await this.compilationCache.getValid(cacheKey);
+      if (!cached) return null;
+      const validation = inspectMissionNeeds(cached.missionSpec, input.goal);
+      const authorityMatches = cached.missionSpec.budgetPaise === input.maximumAuthorityPaise
+        && cached.missionSpec.repairAuthority.maxAdditionalSpendPaise === (input.repairAllowancePaise ?? 0);
+      if (!validation.valid || !authorityMatches) return null;
+      this.logger.info("MISSION_COMPILER_CACHE_HIT", { compilerSource: "CACHED_AI_COMPILATION", cacheKeyPrefix: cacheKey.slice(0, 12), provider: cached.compilerProvider, model: cached.compilerModel });
+      return cached.missionSpec;
+    } catch (error) {
+      this.logger.info("MISSION_COMPILER_CACHE_ERROR", { operation: "read", errorType: error instanceof Error ? error.name : "unknown" });
+      return null;
+    }
+  }
+
+  private async writeValidCachedCompilation(entry: Parameters<MissionCompilationCache["putValid"]>[0]) {
+    try {
+      await this.compilationCache.putValid(entry);
+      this.logger.info("MISSION_COMPILER_CACHE_WRITE", { compilerSource: "LIVE_AI", cacheKeyPrefix: entry.cacheKey.slice(0, 12), provider: entry.compilerProvider, model: entry.compilerModel });
+    } catch (error) {
+      this.logger.info("MISSION_COMPILER_CACHE_ERROR", { operation: "write", errorType: error instanceof Error ? error.name : "unknown" });
+    }
   }
 
   private providerConfig(provider: CompilerProvider): CompilerProviderConfig {
