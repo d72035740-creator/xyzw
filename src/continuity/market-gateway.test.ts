@@ -76,4 +76,12 @@ describe("SerpApiShoppingConnector", () => {
     const travel = { ...need, id: "travel", kind: "TRAVEL" as const, label: "Train ticket" };
     await expect(new MarketGateway("live", []).search([travel], { missionId: "m", locationLabel: "Varanasi" })).rejects.toMatchObject({ code: "NO_SUPPORTED_MARKET_SOURCE" });
   });
+
+  it("runs one generic refined Shopping query when a product has no exact price", async () => {
+    const connector = { connectorId: "test-shopping", supports: () => true, search: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([{ id: "fallback", needId: need.id, source: { provider: "test-shopping", externalId: "fallback" }, merchant: { name: "Store" }, title: "144Hz monitor", pricePaise: 1_000_000, currency: "INR", availability: "UNKNOWN", observedAt: new Date().toISOString(), sourceVersion: "v1", attributes: { refreshRateHz: 144 }, evidence: { title: "listing", pricingStatus: "KNOWN" }, reversibility: { type: "UNKNOWN" } }]) };
+    const [result] = await new MarketGateway("live", [connector]).search([need], { missionId: "m" });
+    expect(result.offers).toHaveLength(1);
+    expect(connector.search).toHaveBeenCalledTimes(2);
+    expect(connector.search.mock.calls[1][0].label).toContain("buy online price India");
+  });
 });

@@ -60,6 +60,11 @@ export function marketQueryFor(need: MissionNeed, context: MarketSearchContext) 
   return `${base} ${qualifier}${location}${country}`.replace(/\s+/g, " ").trim();
 }
 
+function refinedShoppingNeed(need: MissionNeed): MissionNeed {
+  const constraints = Object.entries(need.requiredAttributes).map(([key, value]) => `${key} ${String(value)}`).join(" ");
+  return { ...need, label: `${need.label} buy online price India${constraints ? ` ${constraints}` : ""}` };
+}
+
 type SerpShoppingResult = {
   product_id?: string; title?: string; source?: string; extracted_price?: number | string; price?: string;
   product_link?: string; link?: string; snippet?: string; delivery?: string;
@@ -255,7 +260,8 @@ export class MarketGateway {
       const connector = this.connectorFor(need);
       if (!connector) return { need, connectorId: null, query, offers: [], error: new ContinuityError("NO_SUPPORTED_MARKET_SOURCE", `No supported market source exists for ${need.label}`, 422, { needId: need.id, kind: need.kind }) };
       try {
-        const offers = await connector.search(need, context);
+        let offers = await connector.search(need, context);
+        if (!offers.some(hasKnownPrice) && need.kind === "PRODUCT") offers = await connector.search(refinedShoppingNeed(need), context);
         if (!offers.length) return { need, connectorId: connector.connectorId, query, offers, error: new ContinuityError("NO_SUPPORTED_MARKET_SOURCE", `No supported market results found for ${need.label}`, 409, { needId: need.id }) };
         if (!offers.some(hasKnownPrice)) return { need, connectorId: connector.connectorId, query, offers, error: new ContinuityError("INSUFFICIENT_PRICING_EVIDENCE", `No exact transaction price is available for ${need.label}`, 409, { needId: need.id }) };
         return { need, connectorId: connector.connectorId, query, offers };
