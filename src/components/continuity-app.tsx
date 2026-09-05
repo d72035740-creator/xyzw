@@ -77,6 +77,15 @@ export function ContinuityApp() {
 
   async function run(label: string, work: () => Promise<void>) { setBusy(label); setError(""); try { await work(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Mission failed"); } finally { setBusy(""); } }
   async function refresh(id = view?.mission.id) { if (id) setView(await request<View>(`/api/continuity/missions/${id}`)); }
+  async function mutateView(work: (current: View) => Promise<View>) {
+    const initial = view; if (!initial) return null;
+    try { const next = await work(initial); setView(next); setError(""); return next; }
+    catch (cause) {
+      if (!(cause instanceof MissionRequestError) || !["STALE_PLAN", "MISSION_VERSION_MISMATCH"].includes(cause.code)) throw cause;
+      const current = await request<View>(`/api/continuity/missions/${initial.mission.id}`); setView(current); setError("");
+      const next = await work(current); setView(next); return next;
+    }
+  }
   function missionInput() {
     const location = manualLocation.trim() || browserLocation ? { manualLabel: manualLocation.trim() || undefined, browser: browserLocation ?? undefined } : undefined;
     return { goal, maximumAuthorityPaise: Math.round(Number(authority) * 100), repairAllowancePaise: Math.round(Number(repair) * 100), location };
@@ -104,16 +113,18 @@ export function ContinuityApp() {
       setManualLocationOpen(true);
     }, { enableHighAccuracy: false, timeout: 10_000, maximumAge: 300_000 });
   }
-  async function replace(needId: string) { if (view) await run(view.marketMode === "live" ? `SEARCHING LIVE MARKET FOR REPLACEMENT… · PRESERVING ${view.spec.needs.length - 1} OF ${view.spec.needs.length} COMPONENTS` : "REPAIRING 1 COMPONENT", async () => { const execute = (current: View) => request<View>(`/api/continuity/missions/${current.mission.id}/replace`, { method: "POST", body: JSON.stringify({ needId, expectedVersion: current.mission.version }) }); try { setView(await execute(view)); } catch (cause) { if (!(cause instanceof MissionRequestError) || !["STALE_PLAN", "MISSION_VERSION_MISMATCH"].includes(cause.code)) throw cause; const current = await request<View>(`/api/continuity/missions/${view.mission.id}`); setView(current); setView(await execute(current)); } }); }
-  async function revalidate() { if (view) await run("REVALIDATING LIVE MARKET", async () => setView(await request<View>(`/api/continuity/missions/${view.mission.id}/revalidate`, { method: "POST", body: JSON.stringify({ expectedVersion: view.mission.version }) }))); }
-  async function selectPortfolio(type: string) { if (view) await run("APPLYING PORTFOLIO", async () => setView(await request<View>(`/api/continuity/missions/${view.mission.id}/portfolio`, { method: "POST", body: JSON.stringify({ type, expectedVersion: view.mission.version }) }))); }
-  async function report(needId: string) { if (view) await run("RECORDING OUTCOME ISSUE", async () => setView(await request<View>(`/api/continuity/missions/${view.mission.id}/issues`, { method: "POST", body: JSON.stringify({ needId, issue: "Item unavailable" }) }))); }
+  async function replace(needId: string) { if (view) await run(view.marketMode === "live" ? `SEARCHING LIVE MARKET FOR REPLACEMENT… · PRESERVING ${view.spec.needs.length - 1} OF ${view.spec.needs.length} COMPONENTS` : "REPAIRING 1 COMPONENT", async () => { await mutateView(current => request<View>(`/api/continuity/missions/${current.mission.id}/replace`, { method: "POST", body: JSON.stringify({ needId, expectedVersion: current.mission.version }) })); }); }
+  async function revalidate() { await run("REVALIDATING LIVE MARKET", async () => { await mutateView(current => request<View>(`/api/continuity/missions/${current.mission.id}/revalidate`, { method: "POST", body: JSON.stringify({ expectedVersion: current.mission.version }) })); }); }
+  async function selectPortfolio(type: string) { await run("APPLYING PORTFOLIO", async () => { await mutateView(current => request<View>(`/api/continuity/missions/${current.mission.id}/portfolio`, { method: "POST", body: JSON.stringify({ type, expectedVersion: current.mission.version }) })); }); }
+  async function report(needId: string) { await run("RECORDING OUTCOME ISSUE", async () => { await mutateView(current => request<View>(`/api/continuity/missions/${current.mission.id}/issues`, { method: "POST", body: JSON.stringify({ needId, issue: "Item unavailable" }) })); }); }
   async function pay() {
     if (!view) return;
     setBusy("REVALIDATING LIVE MARKET… · Checking prices and availability before money moves.");
     setError("");
     try {
-      const order = await request<{ providerOrderId: string; amount: number; currency: string; publicKeyId: string; marketRevalidated: boolean }>(`/api/missions/${view.mission.id}/payment-order`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ expectedVersion: view.mission.version }) });
+      const current = view;
+      const order = await request<{ providerOrderId: string; amount: number; currency: string; publicKeyId: string; marketRevalidated: boolean; view: View }>(`/api/missions/${current.mission.id}/payment-order`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ expectedVersion: current.mission.version }) });
+      if (order.view) { setView(order.view); setError(""); }
       setBusy(order.marketRevalidated ? "MARKET VERIFIED ✓ · OPENING RAZORPAY…" : "OPENING RAZORPAY TEST MODE…");
       await checkoutScript();
       const Razorpay = window.Razorpay;

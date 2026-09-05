@@ -7,6 +7,6 @@ export class PaymentOrderCoordinator {
   async createOrder(input: { missionId: string; expectedVersion: number; requestKey?: string }) {
     const preparation = await this.continuity.prepareForPayment(input.missionId, input.expectedVersion);
     const order = await this.payments.createOrder({ ...input, expectedVersion: preparation.missionVersion });
-    return { ...order, marketRevalidated: preparation.marketRevalidated };
+    return { ...order, marketRevalidated: preparation.marketRevalidated, view: await this.continuity.getWithRepairs(input.missionId) };
   }
 }
