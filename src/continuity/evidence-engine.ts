@@ -167,6 +167,16 @@ function combinations<T>(groups: T[][], limit = 625): T[][] {
   return result;
 }
 
+function diverseShortlist(candidates: SnapshotCandidate[], limit: number) {
+  const cheapest = [...candidates].sort((a, b) => a.pricePaise - b.pricePaise);
+  const strength = [...candidates].sort((a, b) => {
+    const score = (candidate: SnapshotCandidate) => Object.entries(candidate.attributes).reduce((total, [key, value]) => total + (key.startsWith("rated_") && typeof value === "number" ? value : value === true ? 1_000 : 0), 0) + (typeof candidate.evidence?.rating === "number" ? candidate.evidence.rating as number * 100 : 0);
+    return score(b) - score(a) || b.pricePaise - a.pricePaise;
+  });
+  const premium = [...candidates].sort((a, b) => b.pricePaise - a.pricePaise);
+  return [...new Map([...cheapest.slice(0, 3), ...strength.slice(0, 3), ...premium.slice(0, 3)].map((candidate) => [candidate.id, candidate])).values()].slice(0, limit);
+}
+
 export function optimizePortfolios(groups: CandidateAssessment[][], budgetPaise: number): DecisionPortfolio[] {
   if (groups.some((group) => !group.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "Every required need needs at least one evidence-qualified candidate", 409);
   const feasible = combinations(groups.map((group) => group.slice(0, 5))).map((items) => ({ items, total: items.reduce((sum, item) => sum + item.currentPricePaise, 0), utility: items.reduce((sum, item) => sum + item.scores.utility, 0) / items.length })).filter((portfolio) => portfolio.total <= budgetPaise);
@@ -193,7 +203,7 @@ export class EvidenceDecisionEngine {
 
   async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
     const { profile, weights } = inferDecisionProfile(spec.goal, spec.optimizationIntent);
-    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, live ? 3 : 12));
+    const shortlists = spec.needs.map((need) => diverseShortlist(candidatesByNeed.get(need.id) ?? [], live ? 8 : 12));
     if (shortlists.some((shortlist) => !shortlist.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "No candidate satisfies every deterministic hard constraint", 409);
 
     const evidence: EvidenceRecordInput[] = [];

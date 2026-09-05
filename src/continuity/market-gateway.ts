@@ -121,7 +121,7 @@ export class SerpApiShoppingConnector implements MarketConnector {
         evidence: { title: item.title, snippet: item.snippet, sourceUrl, locationLabel: context.locationLabel, deliveryText: item.delivery, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN", pricingStatus: "KNOWN" },
         reversibility: { type: "UNKNOWN" },
       }];
-    }).slice(0, 5);
+    }).slice(0, 10);
     marketDiagnostic("SHOPPING_CANDIDATE_COUNTS", { needId: need.id, shoppingResultsReturned: shoppingResults.length, candidatesWithParsedPrice: offers.length, candidatesRejectedPrice: rejectedPrice });
     return offers;
   }
@@ -158,7 +158,7 @@ export class SerperShoppingConnector implements MarketConnector {
         else if (typeof expected === "string" && lower.includes(expected.toLowerCase())) attributes[key] = expected;
       }
       return [{ id: randomUUID(), needId: need.id, source: { provider: this.connectorId, externalId, url: item.link }, merchant: { name: item.source }, title: item.title, pricePaise, currency: "INR", availability: "UNKNOWN", observedAt, sourceVersion: version([externalId, pricePaise, item.source, item.title, observedAt]), attributes, evidence: { title: item.title, sourceUrl: item.link, locationLabel: context.locationLabel, deliveryText: item.delivery, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN", pricingStatus: "KNOWN", rating: item.rating }, reversibility: { type: "UNKNOWN" } }];
-    }).slice(0, 5);
+    }).slice(0, 10);
     marketDiagnostic("SHOPPING_REQUEST_END", { provider: "serper", query, httpStatus: response.status, resultsCount: shoppingResults.length, elapsedMs: Date.now() - startedAt });
     marketDiagnostic("SHOPPING_CANDIDATE_COUNTS", { needId: need.id, shoppingResultsReturned: shoppingResults.length, candidatesWithParsedPrice: offers.length, candidatesRejectedPrice: rejectedPrice });
     return offers;
