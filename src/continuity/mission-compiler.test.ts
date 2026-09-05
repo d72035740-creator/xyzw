@@ -31,7 +31,7 @@ function groqCompiler(outputs: unknown[], logger = { info: vi.fn() }) {
   vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
   const fetcher = vi.fn();
   for (const output of outputs) fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ output_text: typeof output === "string" ? output : JSON.stringify(output) }), { status: 200 }));
-  return { compiler: new MissionCompiler(fetcher as typeof fetch, logger), fetcher, logger };
+  return { compiler: new MissionCompiler(fetcher as typeof fetch, logger, async () => {}), fetcher, logger };
 }
 function assertStrictObjectSchema(value: unknown, path = "root") {
   if (!value || typeof value !== "object") return;
@@ -297,11 +297,57 @@ describe("MissionCompiler", () => {
     const goal = "Buy flowers under ₹1,000";
     const empty = modelSpec(goal, 100_000, []);
     const repaired = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
-    const { compiler, fetcher } = groqCompiler([empty, repaired]);
+    const { compiler, fetcher, logger } = groqCompiler([empty, repaired]);
     expect((await compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).needs).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(logger.info).not.toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.anything());
     expect(JSON.parse(JSON.parse(fetcher.mock.calls[1][1]?.body as string).input).validatorErrorCodes).toEqual(["NO_ACTIONABLE_COMMERCE_NEEDS"]);
     expect(JSON.parse(fetcher.mock.calls[1][1]?.body as string).instructions).toContain("identify only a genuinely indispensable CORE_REQUIREMENT");
+  });
+
+  it("retries Groq json_validate_failed once and then accepts a valid MissionSpec", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const goal = "Buy flowers under ₹1,000";
+    const valid = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
+    const logger = { info: vi.fn() };
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "json_validate_failed", message: "Regenerate strict output" } }), { status: 400, headers: { "x-request-id": "req_retry" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ output_text: JSON.stringify(valid) }), { status: 200 }));
+    const compiler = new MissionCompiler(fetcher as typeof fetch, logger, async () => {});
+    expect((await compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).needs).toHaveLength(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 1, httpStatus: 400, errorCode: "json_validate_failed", requestId: "req_retry", retrying: true }));
+  });
+
+  it("retries a transient Groq 503 once and then succeeds", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const goal = "Buy flowers under ₹1,000";
+    const valid = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { type: "server_error", code: "temporarily_unavailable" } }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ output_text: JSON.stringify(valid) }), { status: 200 }));
+    const compiler = new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }, async () => {});
+    await expect(compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).resolves.toMatchObject({ budgetPaise: 100_000 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry permanent Groq authentication failures", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const logger = { info: vi.fn() };
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { type: "authentication_error", code: "invalid_api_key" } }), { status: 401 }));
+    await expect(new MissionCompiler(fetcher as typeof fetch, logger, async () => {}).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 1, httpStatus: 401, retrying: false }));
+  });
+
+  it("fails after exactly two retryable Groq provider attempts", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const failure = () => new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "json_validate_failed" } }), { status: 400 });
+    const logger = { info: vi.fn() };
+    const fetcher = vi.fn().mockResolvedValueOnce(failure()).mockResolvedValueOnce(failure());
+    await expect(new MissionCompiler(fetcher as typeof fetch, logger, async () => {}).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(logger.info).toHaveBeenLastCalledWith("MISSION_COMPILER_PROVIDER_ERROR", expect.objectContaining({ providerAttempt: 2, errorCode: "json_validate_failed", retrying: false }));
   });
 
   it("reports Groq configuration and provider failures without mock fallback", async () => {
@@ -315,7 +361,7 @@ describe("MissionCompiler", () => {
     const failedFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "schema_invalid", message: "Invalid schema; token test-groq-key must stay private" } }), { status: 400, headers: { "x-request-id": "req_sanitized_123" } }));
     await expect(new MissionCompiler(failedFetcher as typeof fetch, logger).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE", details: { providerStatus: 400 } });
     expect(failedFetcher).toHaveBeenCalledTimes(1);
-    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", { provider: "groq", model: "openai/gpt-oss-120b", httpStatus: 400, groqRequestId: "req_sanitized_123", errorType: "invalid_request_error", errorCode: "schema_invalid", sanitizedMessage: "Invalid schema; token [REDACTED] must stay private" });
+    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", { provider: "groq", model: "openai/gpt-oss-120b", providerAttempt: 1, httpStatus: 400, requestId: "req_sanitized_123", errorType: "invalid_request_error", errorCode: "schema_invalid", retrying: false, sanitizedMessage: "Invalid schema; token [REDACTED] must stay private" });
   });
 
   it("treats mission text as data and preserves server authority despite embedded instructions", async () => {
