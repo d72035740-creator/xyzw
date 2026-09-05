@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MissionCompiler } from "./mission-compiler";
+import { MISSION_SPEC_JSON_SCHEMA, MissionCompiler } from "./mission-compiler";
 import { inspectMissionNeeds } from "./mission-semantic-validator";
 import { missionLocationInputSchema } from "./types";
 
@@ -32,6 +32,20 @@ function groqCompiler(outputs: unknown[], logger = { info: vi.fn() }) {
   const fetcher = vi.fn();
   for (const output of outputs) fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ output_text: typeof output === "string" ? output : JSON.stringify(output) }), { status: 200 }));
   return { compiler: new MissionCompiler(fetcher as typeof fetch, logger), fetcher, logger };
+}
+function assertStrictObjectSchema(value: unknown, path = "root") {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertStrictObjectSchema(item, `${path}[${index}]`));
+    return;
+  }
+  const schema = value as Record<string, unknown>;
+  if (schema.type === "object") {
+    expect(schema.additionalProperties, `${path}.additionalProperties`).toBe(false);
+    const properties = schema.properties as Record<string, unknown>;
+    expect([...(schema.required as string[])].sort(), `${path}.required`).toEqual(Object.keys(properties).sort());
+  }
+  for (const [key, nested] of Object.entries(schema)) assertStrictObjectSchema(nested, `${path}.${key}`);
 }
 
 describe("MissionCompiler", () => {
@@ -179,9 +193,26 @@ describe("MissionCompiler", () => {
     expect(init?.headers).toMatchObject({ Authorization: "Bearer test-groq-key" });
     const body = JSON.parse(init?.body as string);
     expect(body).toMatchObject({ model: "openai/gpt-oss-120b", text: { format: { type: "json_schema", name: "mission_spec", strict: true } } });
-    expect(body.store).toBeUndefined();
+    for (const unsupported of ["store", "truncation", "include", "previous_response_id", "safety_identifier", "prompt_cache_key", "prompt", "response_format"]) expect(body[unsupported]).toBeUndefined();
     expect(body.text.format.schema.required).toContain("needs");
     expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_DIAGNOSTIC", expect.objectContaining({ compilerProvider: "groq", modelId: "openai/gpt-oss-120b", validationResult: "VALID" }));
+  });
+
+  it("extracts assistant structured output after a preceding GPT-OSS reasoning item", async () => {
+    const goal = "Buy flowers under ₹1,000";
+    const output = modelSpec(goal, 100_000, [{ id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" }]);
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq"); vi.stubEnv("GROQ_API_KEY", "test-groq-key"); vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output: [
+      { type: "reasoning", content: [{ type: "reasoning_text", text: "private reasoning that must be ignored" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: JSON.stringify(output) }] },
+    ] }), { status: 200 }));
+    const spec = await new MissionCompiler(fetcher as typeof fetch, { info: vi.fn() }).compile({ goal, maximumAuthorityPaise: 100_000 });
+    expect(spec.needs).toEqual([expect.objectContaining({ label: "Flowers" })]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps every object in the strict MissionSpec JSON schema closed and fully required", () => {
+    assertStrictObjectSchema(MISSION_SPEC_JSON_SCHEMA);
   });
 
   it("keeps the same one-attempt semantic repair loop on Groq", async () => {
@@ -201,9 +232,11 @@ describe("MissionCompiler", () => {
     expect(unusedFetcher).not.toHaveBeenCalled();
 
     vi.stubEnv("GROQ_API_KEY", "test-groq-key");
-    const failedFetcher = vi.fn().mockResolvedValue(new Response("unavailable", { status: 503 }));
-    await expect(new MissionCompiler(failedFetcher as typeof fetch).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE", details: { providerStatus: 503 } });
+    const logger = { info: vi.fn() };
+    const failedFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { type: "invalid_request_error", code: "schema_invalid", message: "Invalid schema; token test-groq-key must stay private" } }), { status: 400, headers: { "x-request-id": "req_sanitized_123" } }));
+    await expect(new MissionCompiler(failedFetcher as typeof fetch, logger).compile({ goal: "Buy flowers under ₹1,000", maximumAuthorityPaise: 100_000 })).rejects.toMatchObject({ code: "MISSION_COMPILER_UNAVAILABLE", details: { providerStatus: 400 } });
     expect(failedFetcher).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_PROVIDER_ERROR", { provider: "groq", model: "openai/gpt-oss-120b", httpStatus: 400, groqRequestId: "req_sanitized_123", errorType: "invalid_request_error", errorCode: "schema_invalid", sanitizedMessage: "Invalid schema; token [REDACTED] must stay private" });
   });
 
   it("treats mission text as data and preserves server authority despite embedded instructions", async () => {
