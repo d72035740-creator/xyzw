@@ -11,6 +11,21 @@ export interface MarketConnector {
 }
 
 const version = (parts: unknown[]) => createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+const SHOPPING_TIMEOUT_MS = 3_500;
+
+async function boundedMap<T, R>(values: T[], concurrency: number, action: (value: T) => Promise<R>) {
+  const results: R[] = new Array(values.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (next < values.length) {
+      const index = next++;
+      results[index] = await action(values[index]);
+    }
+  }));
+  return results;
+}
+
+function marketDiagnostic(event: string, data: Record<string, unknown>) { console.info(event, data); }
 
 export function hasKnownPrice(offer: MarketOffer): offer is MarketOffer & { pricePaise: number } {
   return typeof offer.pricePaise === "number" && Number.isInteger(offer.pricePaise) && offer.pricePaise > 0;
@@ -65,7 +80,11 @@ export class SerpApiShoppingConnector implements MarketConnector {
     url.searchParams.set("hl", "en");
     url.searchParams.set("api_key", this.apiKey);
     if (context.locationLabel) url.searchParams.set("location", context.locationLabel);
-    const response = await this.fetcher(url, { signal: AbortSignal.timeout(12_000) });
+    const startedAt = Date.now();
+    let response: Response;
+    try { response = await this.fetcher(url, { signal: AbortSignal.timeout(SHOPPING_TIMEOUT_MS) }); }
+    catch (error) { marketDiagnostic("SHOPPING_REQUEST_END", { provider: this.connectorId, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    marketDiagnostic("SHOPPING_REQUEST_END", { provider: this.connectorId, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
     if (!response.ok) throw new ContinuityError("LIVE_MARKET_PROVIDER_FAILED", "Live shopping search failed", 502, { providerStatus: response.status });
     const body = await response.json() as { shopping_results?: SerpShoppingResult[] };
     return (body.shopping_results ?? []).flatMap((item, index): MarketOffer[] => {
@@ -89,7 +108,7 @@ export class SerpApiShoppingConnector implements MarketConnector {
         evidence: { title: item.title, snippet: item.snippet, sourceUrl, locationLabel: context.locationLabel, deliveryText: item.delivery, locationCompatibility: deliverySupported ? "SUPPORTED_EVIDENCE" : "UNKNOWN", pricingStatus: "KNOWN" },
         reversibility: { type: "UNKNOWN" },
       }];
-    }).slice(0, 12);
+    }).slice(0, 5);
   }
 
   async revalidate(offer: MarketOffer, need: MissionNeed, context: MarketSearchContext) {
@@ -119,7 +138,11 @@ export class SerpApiLocalPlacesConnector implements MarketConnector {
     url.searchParams.set("hl", "en");
     url.searchParams.set("api_key", this.apiKey);
     if (context.latitude !== undefined && context.longitude !== undefined) url.searchParams.set("ll", `@${context.latitude},${context.longitude},14z`);
-    const response = await this.fetcher(url, { signal: AbortSignal.timeout(12_000) });
+    const startedAt = Date.now();
+    let response: Response;
+    try { response = await this.fetcher(url, { signal: AbortSignal.timeout(SHOPPING_TIMEOUT_MS) }); }
+    catch (error) { marketDiagnostic("SHOPPING_REQUEST_END", { provider: this.connectorId, elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    marketDiagnostic("SHOPPING_REQUEST_END", { provider: this.connectorId, httpStatus: response.status, elapsedMs: Date.now() - startedAt });
     if (!response.ok) throw new ContinuityError("LIVE_MARKET_PROVIDER_FAILED", "Live local search failed", 502, { providerStatus: response.status });
     const body = await response.json() as { local_results?: SerpLocalResult[] };
     return (body.local_results ?? []).flatMap((item, index): MarketOffer[] => {
@@ -176,7 +199,7 @@ export class MarketGateway {
   private connectorFor(need: MissionNeed) { return this.connectors.find((connector) => connector.supports(need)); }
 
   async search(needs: MissionNeed[], context: MarketSearchContext): Promise<MarketSearchResult[]> {
-    const results = await Promise.all(needs.map(async (need): Promise<MarketSearchResult> => {
+    const results = await boundedMap(needs, 2, async (need): Promise<MarketSearchResult> => {
       const query = marketQueryFor(need, context);
       const connector = this.connectorFor(need);
       if (!connector) return { need, connectorId: null, query, offers: [], error: new ContinuityError("NO_SUPPORTED_MARKET_SOURCE", `No supported market source exists for ${need.label}`, 422, { needId: need.id, kind: need.kind }) };
@@ -188,7 +211,7 @@ export class MarketGateway {
       } catch (error) {
         return { need, connectorId: connector.connectorId, query, offers: [], error: error instanceof ContinuityError ? error : new ContinuityError("MARKET_SEARCH_FAILED", "Market search failed", 502) };
       }
-    }));
+    });
     if (results.every((result) => result.offers.length === 0)) throw results.find((result) => result.error)?.error;
     return results;
   }

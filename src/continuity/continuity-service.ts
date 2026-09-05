@@ -12,6 +12,7 @@ type MissionUnderstandingInput = { goal:string; maximumAuthorityPaise?:number; l
 type MissionSearchInput = { missionId:string; missionVersion:number };
 type MarketGatewayFactory = (mode?: "live" | "sandbox") => MarketGateway;
 const activeStatuses = ["SELECTED", "PRESERVED"];
+function marketDiagnostic(event:string,data:Record<string,unknown>){console.info(event,data);}
 function attributesSatisfy(need: MissionNeed, offer: { attributes: Record<string, unknown> }) { return Object.entries(need.requiredAttributes).every(([key,expected]) => { const actual=offer.attributes[key]; return typeof expected==="number"?typeof actual==="number"&&actual>=expected:actual===expected; }); }
 function compareLocationThenPrice(a: { evidence: Record<string, unknown> | null; pricePaise: number }, b: { evidence: Record<string, unknown> | null; pricePaise: number }) {
   const evidenceRank = (offer: typeof a) => offer.evidence?.locationCompatibility === "SUPPORTED_EVIDENCE" ? 0 : 1;
@@ -45,6 +46,7 @@ export class ContinuityService {
     });
   }
   async build(input:MissionSearchInput){
+    const marketStartedAt=Date.now();
     const [mission]=await this.database.select().from(missions).where(eq(missions.id,input.missionId));
     if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);
     if(mission.version!==input.missionVersion)throw new ContinuityError("STALE_PLAN","Mission version is stale",409);
@@ -52,30 +54,37 @@ export class ContinuityService {
     const [continuity]=await this.database.select().from(continuityMissions).where(eq(continuityMissions.missionId,mission.id));
     if(!continuity)throw new ContinuityError("MISSION_NOT_FOUND","Compiled mission specification not found",404);
     const spec=missionSpecSchema.parse(continuity.spec);
+    marketDiagnostic("MARKET_START",{missionId:mission.id,needCount:spec.needs.length});
     const gateway=this.marketGatewayFactory(continuity.marketMode as "live" | "sandbox");
     try{
       const context={missionId:mission.id,locationLabel:spec.location?.label,latitude:spec.location?.latitude,longitude:spec.location?.longitude};
       let groups;
+      marketDiagnostic("SHOPPING_REQUEST_START",{needCount:spec.needs.length});
       try { groups=await gateway.search(spec.needs,context); } catch(error) { throw marketStageError(error); }
+      marketDiagnostic("CANDIDATE_NORMALIZATION",{elapsedMs:Date.now()-marketStartedAt,candidateCount:groups.reduce((total,group)=>total+group.offers.length,0)});
       const offersByNeed=new Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>();
-      let marketError: ContinuityError | undefined;
       for(const group of groups){
         const pricedOffers=group.offers.filter(hasKnownPrice);
         await this.database.insert(marketSearches).values({missionId:mission.id,needId:group.need.id,connectorId:group.connectorId??"unsupported",query:group.query,status:pricedOffers.length?"SUCCEEDED":"PARTIAL",resultCount:group.offers.length,errorCode:group.error?.code??null});
         if(pricedOffers.length){const saved=await this.database.insert(marketOfferSnapshots).values(pricedOffers.map(o=>snapshotValues(mission.id,o))).returning();offersByNeed.set(group.need.id,saved);}
-        marketError ??= group.error;
       }
-      if(marketError) throw marketStageError(marketError);
+      const unavailableNeed=spec.needs.find(need=>!offersByNeed.has(need.id));
+      if(unavailableNeed)throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER",`No valid price-backed offer satisfies ${unavailableNeed.label}`,409,{needId:unavailableNeed.id});
       const candidateMap=new Map([...offersByNeed].map(([needId,offers])=>[needId,offers.map(offer=>({id:offer.id,needId:offer.needId,title:offer.title,merchantName:offer.merchantName,sourceUrl:offer.sourceUrl,sourceProvider:offer.sourceProvider,pricePaise:offer.pricePaise,attributes:offer.attributes,evidence:offer.evidence}))]));
       let decision;
+      marketDiagnostic("EVIDENCE_REQUEST_START",{elapsedMs:Date.now()-marketStartedAt});
       try { decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live"); } catch(error) { throw evidenceStageError(error); }
+      marketDiagnostic("CAPABILITY_VALIDATION",{elapsedMs:Date.now()-marketStartedAt,assessmentCount:decision.assessments.length});
       const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
       if(!chosen)throw new ContinuityError("PORTFOLIO_NOT_MISSION_VALID","Selected portfolio was not produced",409);
       validateMissionPortfolio(spec,chosen.itemSnapshotIds,candidateMap,decision.assessments);
+      marketDiagnostic("PORTFOLIO_OPTIMIZATION",{elapsedMs:Date.now()-marketStartedAt,portfolioCount:decision.portfolios.length});
       if(decision.evidence.length)await this.database.insert(productEvidence).values(decision.evidence);
       if(decision.assessments.length)await this.database.insert(candidateAssessments).values(decision.assessments.map(assessment=>({missionId:mission.id,needId:assessment.needId,offerSnapshotId:assessment.offerSnapshotId,assessment,utilityScore:assessment.scores.utility})));
       await this.database.insert(decisionRuns).values({missionId:mission.id,profile:decision.profile,weights:decision.weights,portfolios:decision.portfolios,selectedPortfolio:decision.selectedPortfolio,status:"SUCCEEDED"});
-      return await this.reservePlan(mission.id,input.missionVersion,spec,offersByNeed,chosen?.itemSnapshotIds);
+      const view=await this.reservePlan(mission.id,input.missionVersion,spec,offersByNeed,chosen?.itemSnapshotIds);
+      marketDiagnostic("MARKET_END",{missionId:mission.id,elapsedMs:Date.now()-marketStartedAt,status:"SUCCEEDED"});
+      return view;
     }catch(error){await this.database.update(missions).set({status:"INVALIDATED",updatedAt:new Date()}).where(and(eq(missions.id,mission.id),eq(missions.version,input.missionVersion),eq(missions.status,"PLANNING")));throw error;}
   }
   private async reservePlan(missionId:string,expectedVersion:number,spec:ReturnType<typeof missionSpecSchema.parse>,groups:Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>,selectedSnapshotIds:string[]=[]){

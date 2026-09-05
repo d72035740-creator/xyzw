@@ -35,6 +35,22 @@ export type SnapshotCandidate = {
 };
 
 export type SearchEvidence = { title: string; link?: string; snippet?: string; source?: string };
+const EVIDENCE_TIMEOUT_MS = 3_000;
+
+async function settleBounded<T>(jobs: Array<() => Promise<T>>, concurrency = 8) {
+  const settled: PromiseSettledResult<T>[] = new Array(jobs.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, async () => {
+    while (next < jobs.length) {
+      const index = next++;
+      try { settled[index] = { status: "fulfilled", value: await jobs[index]() }; }
+      catch (reason) { settled[index] = { status: "rejected", reason }; }
+    }
+  }));
+  return settled;
+}
+
+function evidenceDiagnostic(event: string, data: Record<string, unknown>) { console.info(event, data); }
 
 export class EvidenceSearchConnector {
   private readonly cache = new Map<string, { expiresAt: number; results: SearchEvidence[] }>();
@@ -45,7 +61,11 @@ export class EvidenceSearchConnector {
     if (cached && cached.expiresAt > Date.now()) return cached.results;
     const url = new URL("https://serpapi.com/search.json");
     url.searchParams.set("engine", "google"); url.searchParams.set("q", query); url.searchParams.set("gl", "in"); url.searchParams.set("hl", "en"); url.searchParams.set("num", "5"); url.searchParams.set("api_key", this.apiKey);
-    const response = await this.fetcher(url, { signal: AbortSignal.timeout(10_000) });
+    const startedAt = Date.now();
+    let response: Response;
+    try { response = await this.fetcher(url, { signal: AbortSignal.timeout(EVIDENCE_TIMEOUT_MS) }); }
+    catch (error) { evidenceDiagnostic("EVIDENCE_REQUEST_END", { provider: "serpapi-google", elapsedMs: Date.now() - startedAt, error: error instanceof Error ? error.name : "request_failed" }); throw error; }
+    evidenceDiagnostic("EVIDENCE_REQUEST_END", { provider: "serpapi-google", httpStatus: response.status, elapsedMs: Date.now() - startedAt });
     if (!response.ok) throw new ContinuityError("EVIDENCE_SEARCH_FAILED", "Evidence search failed", 502, { providerStatus: response.status });
     const body = await response.json() as { organic_results?: SearchEvidence[] };
     const results = (body.organic_results ?? []).filter((result) => result.title).slice(0, 5);
@@ -154,29 +174,18 @@ export class EvidenceDecisionEngine {
 
   async decide(missionId: string, spec: MissionSpec, candidatesByNeed: Map<string, SnapshotCandidate[]>, live: boolean): Promise<DecisionResult> {
     const { profile, weights } = inferDecisionProfile(spec.goal, spec.optimizationIntent);
-    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, 12));
+    const shortlists = spec.needs.map((need) => (candidatesByNeed.get(need.id) ?? []).sort((a, b) => a.pricePaise - b.pricePaise).slice(0, live ? 3 : 12));
     if (shortlists.some((shortlist) => !shortlist.length)) throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER", "No candidate satisfies every deterministic hard constraint", 409);
 
     const evidence: EvidenceRecordInput[] = [];
     for (const candidate of shortlists.flat()) evidence.push({ missionId, needId: candidate.needId, offerSnapshotId: candidate.id, type: "MERCHANT", sourceName: candidate.merchantName, sourceUrl: candidate.sourceUrl ?? undefined, title: candidate.title, snippet: typeof candidate.evidence?.snippet === "string" ? candidate.evidence.snippet : undefined, observedAt: new Date(), evidenceMode: "SEARCH_EVIDENCE", productIdentityConfidence: "HIGH", extractedFacts: candidate.attributes, sentiment: {} });
 
     if (live) {
-      const researchJobs: Array<Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => shortlist.slice(0, 3).flatMap((candidate) => {
+      const researchJobs: Array<() => Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => shortlist.slice(0, 2).map((candidate) => {
         const identity = productIdentity(candidate.title); const identityQuery = [identity.brand, identity.modelNumber, identity.size].filter(Boolean).join(" ") || candidate.title;
-        return ([
-          ["OFFICIAL_SPEC", `${identityQuery} official specifications`],
-          ["PROFESSIONAL_REVIEW", `${identityQuery} review problems long term`],
-          ["COMMUNITY", `site:reddit.com ${identityQuery} review issues`],
-        ] as const).map(async ([type, query]) => ({ candidate, type, results: await this.connector.search(query) }));
+        return async () => ({ candidate, type: "OFFICIAL_SPEC" as const, results: await this.connector.search(`${identityQuery} official specifications`) });
       }));
-      const comparisonJobs: Array<Promise<{ candidate: SnapshotCandidate; type: EvidenceType; results: SearchEvidence[] }>> = shortlists.flatMap((shortlist) => {
-        if (shortlist.length < 2) return [];
-        const [first, second] = shortlist; const firstIdentity = productIdentity(first.title); const secondIdentity = productIdentity(second.title);
-        const firstName = [firstIdentity.brand, firstIdentity.modelNumber, firstIdentity.size].filter(Boolean).join(" ") || first.title;
-        const secondName = [secondIdentity.brand, secondIdentity.modelNumber, secondIdentity.size].filter(Boolean).join(" ") || second.title;
-        return [this.connector.search(`${firstName} vs ${secondName}`).then(results => ({ candidate: first, type: "COMPARISON" as const, results }))];
-      });
-      const settled = await Promise.allSettled([...researchJobs, ...comparisonJobs]);
+      const settled = await settleBounded(researchJobs);
       for (const result of settled) {
         if (result.status !== "fulfilled") continue;
         const { candidate, type, results } = result.value; const identity = productIdentity(candidate.title);
