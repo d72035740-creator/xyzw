@@ -122,8 +122,13 @@ export function ContinuityApp() {
     setBusy("REVALIDATING LIVE MARKET… · Checking prices and availability before money moves.");
     setError("");
     try {
-      const current = view;
-      const order = await request<{ providerOrderId: string; amount: number; currency: string; publicKeyId: string; marketRevalidated: boolean; view: View }>(`/api/missions/${current.mission.id}/payment-order`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ expectedVersion: current.mission.version }) });
+      const prepare = (current: View) => request<{ providerOrderId: string; amount: number; currency: string; publicKeyId: string; marketRevalidated: boolean; view: View }>(`/api/missions/${current.mission.id}/payment-order`, { method: "POST", headers: { "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ expectedVersion: current.mission.version }) });
+      let order;
+      try { order = await prepare(view); }
+      catch (cause) {
+        if (!(cause instanceof MissionRequestError) || !["STALE_PLAN", "MISSION_VERSION_MISMATCH", "PAYMENT_STALE_MISSION"].includes(cause.code)) throw cause;
+        const latest = await request<View>(`/api/continuity/missions/${view.mission.id}`); setView(latest); setError(""); order = await prepare(latest);
+      }
       if (order.view) { setView(order.view); setError(""); }
       setBusy(order.marketRevalidated ? "MARKET VERIFIED ✓ · OPENING RAZORPAY…" : "OPENING RAZORPAY TEST MODE…");
       await checkoutScript();

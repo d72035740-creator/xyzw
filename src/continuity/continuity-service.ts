@@ -233,7 +233,7 @@ export class ContinuityService {
   async prepareForPayment(missionId: string, expectedVersion: number) {
     const current = await this.get(missionId);
     if (!current) return { missionVersion: expectedVersion, marketRevalidated: false };
-    if (current.mission.version !== expectedVersion) return { missionVersion: expectedVersion, marketRevalidated: false };
+    if (current.mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409, { expectedVersion, currentVersion: current.mission.version });
     if (current.mission.status !== "READY_TO_COMMIT") throw new ContinuityError("PAYMENT_NOT_ALLOWED", `Mission must be READY_TO_COMMIT, not ${current.mission.status}`, 409);
     const freshnessSeconds = Number(process.env.MISSIONPAY_MARKET_FRESHNESS_SECONDS ?? 60);
     const selected = current.selections.filter((selection) => activeStatuses.includes(selection.status));
