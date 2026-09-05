@@ -5,7 +5,12 @@ export const missionNeedSchema = z.object({
   id: z.string().min(1), label: z.string().min(1), quantity: z.number().int().positive(),
   kind: missionNeedKindSchema.default("OTHER_COMMERCE"),
   required: z.boolean().optional(),
-  grounding: z.object({ explicit: z.boolean(), inferred: z.boolean(), sourcePhrase: z.string().min(1).nullable() }).optional(),
+  grounding: z.object({
+    explicit: z.boolean(),
+    inferred: z.boolean(),
+    sourcePhrase: z.string().min(1).nullable(),
+    inferenceClass: z.enum(["EXPLICIT", "CORE_REQUIREMENT", "OPTIONAL_ENHANCEMENT"]),
+  }).optional(),
   rationale: z.string().min(1).optional(),
   constraints: z.array(z.string().min(1)).optional(),
   searchQueries: z.array(z.string().min(1)).min(1),

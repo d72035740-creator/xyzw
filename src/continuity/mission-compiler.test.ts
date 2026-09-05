@@ -5,14 +5,14 @@ import { missionLocationInputSchema } from "./types";
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
-type TestNeed = { id: string; label: string; kind: "PRODUCT" | "RESTAURANT" | "LOCAL_SERVICE" | "TRAVEL" | "OTHER_COMMERCE"; explicit: boolean; sourcePhrase: string; dependencies?: readonly string[] };
+type TestNeed = { id: string; label: string; kind: "PRODUCT" | "RESTAURANT" | "LOCAL_SERVICE" | "TRAVEL" | "OTHER_COMMERCE"; explicit: boolean; sourcePhrase: string; inferenceClass?: "EXPLICIT" | "CORE_REQUIREMENT" | "OPTIONAL_ENHANCEMENT"; dependencies?: readonly string[] };
 function modelSpec(goal: string, budgetPaise: number, needs: TestNeed[], participants: Array<{ label: string; count: number | null; role: string | null }> = [], optimizationIntent = "BEST_VALUE") {
   return {
     goal, budgetPaise, currency: "INR", deadline: null, deadlineText: null, optimizationIntent,
     participants, preferences: [],
     needs: needs.map((need) => ({
       id: need.id, label: need.label, kind: need.kind, quantity: 1, required: true,
-      grounding: { explicit: need.explicit, inferred: !need.explicit, sourcePhrase: need.sourcePhrase },
+      grounding: { explicit: need.explicit, inferred: !need.explicit, sourcePhrase: need.sourcePhrase, inferenceClass: need.inferenceClass ?? (need.explicit ? "EXPLICIT" : "CORE_REQUIREMENT") },
       rationale: need.explicit ? "Directly requested by the user." : "Necessary to make the requested outcome function as a complete system.",
       constraints: [], searchQueries: [`${need.label} India`], requiredAttributes: [], dependencies: [...(need.dependencies ?? [])],
     })),
@@ -148,6 +148,69 @@ describe("MissionCompiler", () => {
     expect(inspectMissionNeeds(spec, goal).errorCodes).toEqual([]);
   });
 
+  it("accepts a grounded core dining requirement for the exact vegetarian dinner mission", async () => {
+    const goal = "Plan a vegetarian dinner for two in Varanasi.";
+    const output = modelSpec(goal, 500_000, [
+      { id: "dining", label: "Vegetarian restaurant dining", kind: "RESTAURANT", explicit: false, sourcePhrase: "vegetarian dinner" },
+    ], [{ label: "diners", count: 2, role: "participant" }]);
+    const { compiler } = openAICompiler([output]);
+    const spec = await compiler.compile({ goal, maximumAuthorityPaise: 500_000 });
+    expect(spec.location).toEqual({ source: "prompt", label: "Varanasi" });
+    expect(spec.needs).toEqual([expect.objectContaining({ kind: "RESTAURANT", required: true, grounding: expect.objectContaining({ inferred: true, inferenceClass: "CORE_REQUIREMENT", sourcePhrase: "vegetarian dinner" }) })]);
+    expect(spec.needs.map((need) => need.label.toLowerCase()).join(" ")).not.toMatch(/gift|flowers|cake|decor/);
+    expect(inspectMissionNeeds(spec, goal)).toEqual({ valid: true, errorCodes: [] });
+  });
+
+  it("infers dinner commerce but not relationship-based gifts", async () => {
+    const goal = "Plan dinner with my girlfriend.";
+    const output = modelSpec(goal, 500_000, [
+      { id: "dining", label: "Restaurant dining", kind: "RESTAURANT", explicit: false, sourcePhrase: "dinner" },
+    ], [{ label: "girlfriend", count: 1, role: "participant" }]);
+    const { compiler } = openAICompiler([output]);
+    const spec = await compiler.compile({ goal, maximumAuthorityPaise: 500_000 });
+    expect(spec.needs.map((need) => need.label.toLowerCase()).join(" ")).toBe("restaurant dining");
+    expect(spec.participants).toContainEqual(expect.objectContaining({ label: "girlfriend" }));
+  });
+
+  it("keeps core inference distinct from an explicitly requested enhancement", async () => {
+    const goal = "Plan dinner with my girlfriend and buy flowers.";
+    const output = modelSpec(goal, 500_000, [
+      { id: "dining", label: "Restaurant dining", kind: "RESTAURANT", explicit: false, sourcePhrase: "dinner" },
+      { id: "flowers", label: "Flowers", kind: "PRODUCT", explicit: true, sourcePhrase: "flowers" },
+    ], [{ label: "girlfriend", count: 1, role: "participant" }]);
+    const { compiler } = openAICompiler([output]);
+    const spec = await compiler.compile({ goal, maximumAuthorityPaise: 500_000 });
+    expect(spec.needs.map((need) => [need.label, need.grounding?.inferenceClass])).toEqual([
+      ["Restaurant dining", "CORE_REQUIREMENT"],
+      ["Flowers", "EXPLICIT"],
+    ]);
+  });
+
+  it.each([
+    ["Set up a temporary podcast recording station.", ["Multi-person audio capture", "Audio monitoring"]],
+    ["Create a rooftop movie night for twelve people.", ["Outdoor projection", "Outdoor screen", "Outdoor audio"]],
+  ])("accepts dynamic grounded core equipment without a product dictionary: %s", async (goal, labels) => {
+    const needs = labels.map((label, index) => ({ id: `need-${index}`, label, kind: "PRODUCT" as const, explicit: false, sourcePhrase: goal.includes("podcast") ? "podcast recording station" : "rooftop movie night" }));
+    const output = modelSpec(goal, 1_000_000, needs, goal.includes("twelve") ? [{ label: "participants", count: 12, role: "participant" }] : []);
+    const { compiler } = openAICompiler([output]);
+    const spec = await compiler.compile({ goal, maximumAuthorityPaise: 1_000_000 });
+    expect(spec.needs.map((need) => need.label)).toEqual(labels);
+    expect(spec.needs.every((need) => need.grounding?.inferenceClass === "CORE_REQUIREMENT")).toBe(true);
+    expect(inspectMissionNeeds(spec, goal).valid).toBe(true);
+  });
+
+  it("rejects optional enhancements even when their source phrase is grounded", async () => {
+    const goal = "Plan dinner with my girlfriend.";
+    const candidate = modelSpec(goal, 500_000, [
+      { id: "gift", label: "Gift", kind: "PRODUCT", explicit: false, sourcePhrase: "girlfriend", inferenceClass: "OPTIONAL_ENHANCEMENT" },
+    ], [{ label: "girlfriend", count: 1, role: "participant" }]);
+    const { compiler } = openAICompiler([candidate, candidate]);
+    await expect(compiler.compile({ goal, maximumAuthorityPaise: 500_000 })).rejects.toMatchObject({
+      code: "MISSION_SEMANTIC_INVALID",
+      details: { validatorErrorCodes: expect.arrayContaining(["OPTIONAL_ENHANCEMENT_NOT_ALLOWED"]) },
+    });
+  });
+
   it("repairs a participant misclassified as a need exactly once", async () => {
     const goal = "Plan a vegetarian anniversary dinner for two in Varanasi.";
     const bad = modelSpec(goal, 500_000, [{ id: "person", label: "diners", kind: "OTHER_COMMERCE", explicit: false, sourcePhrase: "for two" }], [{ label: "diners", count: 2, role: "participant" }]);
@@ -223,6 +286,7 @@ describe("MissionCompiler", () => {
     expect((await compiler.compile({ goal, maximumAuthorityPaise: 100_000 })).needs).toHaveLength(1);
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(JSON.parse(JSON.parse(fetcher.mock.calls[1][1]?.body as string).input).validatorErrorCodes).toEqual(["NO_ACTIONABLE_COMMERCE_NEEDS"]);
+    expect(JSON.parse(fetcher.mock.calls[1][1]?.body as string).instructions).toContain("identify only a genuinely indispensable CORE_REQUIREMENT");
   });
 
   it("reports Groq configuration and provider failures without mock fallback", async () => {

@@ -5,6 +5,7 @@ export type MissionSemanticErrorCode =
   | "PARTICIPANT_CLASSIFIED_AS_NEED"
   | "MISSION_NEED_TOO_VAGUE"
   | "UNSUPPORTED_OPTIONAL_NEED"
+  | "OPTIONAL_ENHANCEMENT_NOT_ALLOWED"
   | "INVALID_GROUNDING"
   | "INVALID_DEADLINE_GROUNDING"
   | "INVALID_HARD_CONSTRAINT"
@@ -43,13 +44,13 @@ export function inspectMissionNeeds(spec: MissionSpec, sourceGoal = spec.goal): 
     if (need.required === false) errors.add("UNSUPPORTED_OPTIONAL_NEED");
     if (participantNeed(need, spec)) errors.add("PARTICIPANT_CLASSIFIED_AS_NEED");
     if (need.grounding) {
-      const { explicit, inferred, sourcePhrase } = need.grounding;
+      const { explicit, inferred, sourcePhrase, inferenceClass } = need.grounding;
       if (explicit === inferred) errors.add("INVALID_GROUNDING");
-      if (explicit && (!sourcePhrase || !goal.includes(normalized(sourcePhrase)))) errors.add("INVALID_GROUNDING");
+      const groundedInOutcome = Boolean(sourcePhrase && normalized(sourcePhrase) && goal.includes(normalized(sourcePhrase)));
+      if (inferenceClass === "OPTIONAL_ENHANCEMENT") errors.add("OPTIONAL_ENHANCEMENT_NOT_ALLOWED");
+      if (explicit && (inferenceClass !== "EXPLICIT" || !groundedInOutcome)) errors.add("INVALID_GROUNDING");
       if (inferred) {
-        const groundedInOutcome = Boolean(sourcePhrase && goal.includes(normalized(sourcePhrase)));
-        const groundedByDependency = need.dependencies.length > 0 && need.dependencies.every((dependency) => dependency !== need.id);
-        if (!groundedInOutcome && !groundedByDependency) errors.add("INVALID_GROUNDING");
+        if (inferenceClass !== "CORE_REQUIREMENT" || !groundedInOutcome || need.required !== true) errors.add("INVALID_GROUNDING");
         if (!need.rationale || need.rationale.trim().length < 8) errors.add("INVALID_GROUNDING");
       }
     }
