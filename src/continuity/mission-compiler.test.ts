@@ -124,6 +124,21 @@ describe("MissionCompiler", () => {
     expect(inspectMissionNeeds(spec, goal).errorCodes).toEqual([]);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(logger.info).toHaveBeenCalledWith("MISSION_COMPILER_DIAGNOSTIC", expect.objectContaining({ validationResult: "VALID", needCount: 6 }));
+    expect(JSON.parse(fetcher.mock.calls[0][1]?.body as string).instructions).toContain("one independently purchasable unit");
+  });
+
+  it("repairs a non-atomic product need into independently searchable components", async () => {
+    const goal = "Buy a projector and screen under ₹50,000.";
+    const combined = modelSpec(goal, 5_000_000, [{ id: "projection", label: "Projector and screen", kind: "PRODUCT", explicit: true, sourcePhrase: "projector and screen" }]);
+    const atomic = modelSpec(goal, 5_000_000, [
+      { id: "projector", label: "Projector", kind: "PRODUCT", explicit: true, sourcePhrase: "projector" },
+      { id: "screen", label: "Projection screen", kind: "PRODUCT", explicit: true, sourcePhrase: "screen" },
+    ]);
+    const { compiler, fetcher } = openAICompiler([combined, atomic]);
+    const spec = await compiler.compile({ goal, maximumAuthorityPaise: 5_000_000 });
+    expect(spec.needs.map((need) => need.label)).toEqual(["Projector", "Projection screen"]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(JSON.parse(fetcher.mock.calls[1][1]?.body as string).input).validatorErrorCodes).toContain("NON_ATOMIC_MISSION_NEED");
   });
 
   it("extracts a plainly stated lakh budget without relying on a shopping keyword", async () => {

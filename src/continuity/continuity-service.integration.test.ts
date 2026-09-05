@@ -8,8 +8,17 @@ import { MissionPaymentService } from "@/payments/mission-payment-service";
 import { PaymentOrderCoordinator } from "@/payments/payment-order-coordinator";
 import type { PaymentProvider, ProviderPayment } from "@/payments/payment-provider";
 import { ContinuityService } from "./continuity-service";
+import { EvidenceDecisionEngine, EvidenceSearchConnector } from "./evidence-engine";
+import { MarketGateway, SerpApiShoppingConnector } from "./market-gateway";
+import { MissionCompiler } from "./mission-compiler";
+import { ContinuityError } from "./types";
 
 let missionId: string | undefined;
+async function buildMission(service: ContinuityService, input: Parameters<ContinuityService["understand"]>[0]) {
+  const understood = await service.understand(input);
+  missionId = understood.missionId;
+  return service.build({ missionId: understood.missionId, missionVersion: understood.missionVersion });
+}
 class RepairPaymentProvider implements PaymentProvider {
   readonly provider = "razorpay";
   readonly publicKeyId = "rzp_test_repair";
@@ -49,11 +58,79 @@ afterEach(async () => {
 });
 
 describe("MissionPay Continuity PostgreSQL smoke", () => {
+  it("compiles once, persists the rooftop MissionSpec, and searches its atomic product needs through Shopping", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "groq");
+    vi.stubEnv("GROQ_API_KEY", "test-groq-key");
+    vi.stubEnv("MISSIONPAY_PLANNER_MODEL", "openai/gpt-oss-120b");
+    const goal = "I have 24 hours to turn an empty rooftop into a premium outdoor movie night for 20 people under ₹1,00,000. Build the complete setup with a projector, projection screen, powerful audio, reliable backup power, ambient lighting and all required connectivity.";
+    const needInputs = [
+      ["projector", "Outdoor projector", "projector"],
+      ["screen", "Projection screen", "projection screen"],
+      ["audio", "Powerful outdoor audio", "powerful audio"],
+      ["power", "Reliable backup power", "reliable backup power"],
+      ["lighting", "Ambient outdoor lighting", "ambient lighting"],
+      ["connectivity", "Compatible connectivity", "all required connectivity"],
+    ] as const;
+    const compiledSpec = {
+      goal, budgetPaise: 10_000_000, currency: "INR", deadline: null, deadlineText: "within 24 hours", optimizationIntent: "BEST_VALUE",
+      participants: [{ label: "guests", count: 20, role: "participant" }], preferences: [],
+      needs: needInputs.map(([id, label, sourcePhrase]) => ({
+        id, label, kind: "PRODUCT", quantity: 1, required: true,
+        grounding: { explicit: true, inferred: false, sourcePhrase, inferenceClass: "EXPLICIT" },
+        rationale: "Directly requested by the user.", constraints: [], searchQueries: [`${label} India`], requiredAttributes: [], dependencies: [],
+      })),
+      globalConstraints: [{ id: "budget", description: "Stay within authorized budget", type: "BUDGET", value: "10000000", hard: true, sourcePhrase: null }],
+      outcome: { requiredNeedIds: needInputs.map(([id]) => id), predicates: [] },
+      repairAuthority: { allowAutomaticSubstitution: true, maxAdditionalSpendPaise: 0 },
+    };
+    const compilerFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output_text: JSON.stringify(compiledSpec) }), { status: 200 }));
+    const compiler = new MissionCompiler(compilerFetcher as typeof fetch, { info: vi.fn() });
+    const shoppingFetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url);
+      const query = url.searchParams.get("q") ?? "product";
+      return new Response(JSON.stringify({ shopping_results: [{ product_id: query, title: query, source: "Test Shopping Merchant", extracted_price: 1000, product_link: `https://example.test/${encodeURIComponent(query)}` }] }), { status: 200 });
+    });
+    const gateway = new MarketGateway("live", [new SerpApiShoppingConnector("test-serpapi-key", shoppingFetcher as typeof fetch)]);
+    const gatewaySearch = vi.spyOn(gateway, "search");
+    const evidenceFetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ organic_results: [] }), { status: 200 }));
+    const decisionEngine = new EvidenceDecisionEngine(new EvidenceSearchConnector("test-serpapi-key", evidenceFetcher as typeof fetch));
+    const service = new ContinuityService(db, compiler, decisionEngine, () => gateway);
+
+    const understood = await service.understand({ goal, maximumAuthorityPaise: 10_000_000 });
+    missionId = understood.missionId;
+    expect(compilerFetcher).toHaveBeenCalledTimes(1);
+    expect(understood.spec.needs.map((need) => need.label)).toContain("Outdoor projector");
+    expect(understood.spec.needs.map((need) => need.label)).toContain("Projection screen");
+
+    const [persisted] = await db.select().from(continuityMissions).where(eq(continuityMissions.missionId, missionId));
+    const built = await service.build({ missionId, missionVersion: understood.missionVersion });
+    expect(compilerFetcher).toHaveBeenCalledTimes(1);
+    expect(gatewaySearch).toHaveBeenCalledTimes(1);
+    expect(gatewaySearch.mock.calls[0][0]).toEqual(understood.spec.needs);
+    expect((persisted.spec as { needs: unknown[] }).needs).toEqual(understood.spec.needs);
+    expect(shoppingFetcher).toHaveBeenCalledTimes(understood.spec.needs.length);
+    expect(shoppingFetcher.mock.calls.every(([input]) => new URL(String(input)).searchParams.get("engine") === "google_shopping")).toBe(true);
+    expect(built?.spec.needs).toEqual(understood.spec.needs);
+  });
+
+  it("never surfaces a compiler-stage error from market search", async () => {
+    vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
+    const compiler = new MissionCompiler();
+    const compilerCall = vi.spyOn(compiler, "compile");
+    const gateway = new MarketGateway("sandbox");
+    vi.spyOn(gateway, "search").mockRejectedValue(new ContinuityError("MISSION_COMPILER_UNAVAILABLE", "stale compiler error", 503));
+    const service = new ContinuityService(db, compiler, new EvidenceDecisionEngine(), () => gateway);
+    const understood = await service.understand({ goal: "Buy a monitor under ₹20,000", maximumAuthorityPaise: 2_000_000 });
+    missionId = understood.missionId;
+    await expect(service.build({ missionId, missionVersion: understood.missionVersion })).rejects.toMatchObject({ code: "MARKET_SEARCH_FAILED" });
+    expect(compilerCall).toHaveBeenCalledTimes(1);
+  });
+
   it("compiles an arbitrary mission, reserves bounded authority, minimally replaces, and revalidates", async () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000, location: { manualLabel: "Varanasi, Uttar Pradesh" } });
+    const built = await buildMission(service, { goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000, location: { manualLabel: "Varanasi, Uttar Pradesh" } });
     missionId = built!.mission.id;
     expect(built!.spec.needs).toHaveLength(4);
     expect(built!.selections.filter((selection) => selection.status === "SELECTED")).toHaveLength(4);
@@ -91,7 +168,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
       ] }), { status: 200, headers: { "Content-Type": "application/json" } });
     });
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    const built = await buildMission(service, { goal: "Build a gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
     missionId = built!.mission.id;
     const affected = built!.selections.find((selection) => /monitor/i.test(selection.title))!;
     const unaffectedIds = built!.selections.filter((selection) => selection.needId !== affected.needId).map((selection) => selection.id).sort();
@@ -106,7 +183,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    const built = await buildMission(service, { goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
     missionId = built!.mission.id;
 
     const selected = await service.selectPortfolio(missionId, "MAX_PERFORMANCE", built!.mission.version);
@@ -132,7 +209,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("SERPAPI_API_KEY", "test-only-key");
     vi.stubEnv("MISSIONPAY_MARKET_FRESHNESS_SECONDS", "180");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    const built = await buildMission(service, { goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
     missionId = built!.mission.id;
     const active = built!.selections.filter((selection) => selection.status === "SELECTED");
     await db.update(continuityMissions).set({ marketMode: "live" }).where(eq(continuityMissions.missionId, missionId));
@@ -152,7 +229,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("SERPAPI_API_KEY", "test-only-key");
     vi.stubEnv("MISSIONPAY_MARKET_FRESHNESS_SECONDS", "180");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
+    const built = await buildMission(service, { goal: "Build the best gaming setup under ₹55,000 with a 144Hz monitor, mechanical keyboard, wireless mouse and ergonomic chair", maximumAuthorityPaise: 5_500_000, repairAllowancePaise: 100_000 });
     missionId = built!.mission.id;
     const active = built!.selections.filter((selection) => selection.status === "SELECTED");
     const changedId = active[0].externalId;
@@ -174,7 +251,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Buy event essentials under ₹20,000 with projector and wireless microphone", maximumAuthorityPaise: 2_000_000, repairAllowancePaise: 100_000 });
+    const built = await buildMission(service, { goal: "Buy event essentials under ₹20,000 with projector and wireless microphone", maximumAuthorityPaise: 2_000_000, repairAllowancePaise: 100_000 });
     missionId = built!.mission.id;
     const captured = built!.mission.reservedPaise;
     const [originalOrder] = await db.insert(missionPaymentOrders).values({ missionId, missionVersion: built!.mission.version, amount: captured, currency: "INR", provider: "razorpay", providerOrderId: `original_${missionId}`, status: "CAPTURED" }).returning();
@@ -211,7 +288,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Buy a monitor under ₹10,000", maximumAuthorityPaise: 1_000_000, repairAllowancePaise: 10_000 });
+    const built = await buildMission(service, { goal: "Buy a monitor under ₹10,000", maximumAuthorityPaise: 1_000_000, repairAllowancePaise: 10_000 });
     missionId = built!.mission.id;
     const captured = built!.mission.reservedPaise;
     await db.insert(missionPaymentOrders).values({ missionId, missionVersion: built!.mission.version, amount: captured, providerOrderId: `original_${missionId}`, status: "CAPTURED" });
@@ -232,7 +309,7 @@ describe("MissionPay Continuity PostgreSQL smoke", () => {
     vi.stubEnv("MISSIONPAY_PLANNER_PROVIDER", "mock");
     vi.stubEnv("MISSIONPAY_MARKET_MODE", "sandbox");
     const service = new ContinuityService(db);
-    const built = await service.build({ goal: "Buy a display under ₹10,000", maximumAuthorityPaise: 1_000_000 });
+    const built = await buildMission(service, { goal: "Buy a display under ₹10,000", maximumAuthorityPaise: 1_000_000 });
     missionId = built!.mission.id;
     await db.insert(missionOutcomeEvents).values({ missionId, type: "SMOKE_EVENT", data: { source: "test" } });
     await expect(db.update(missionOutcomeEvents).set({ type: "MUTATED" }).where(eq(missionOutcomeEvents.missionId, missionId))).rejects.toThrow();

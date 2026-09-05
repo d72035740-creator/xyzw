@@ -4,6 +4,7 @@ export type MissionSemanticErrorCode =
   | "NO_ACTIONABLE_COMMERCE_NEEDS"
   | "PARTICIPANT_CLASSIFIED_AS_NEED"
   | "MISSION_NEED_TOO_VAGUE"
+  | "NON_ATOMIC_MISSION_NEED"
   | "UNSUPPORTED_OPTIONAL_NEED"
   | "OPTIONAL_ENHANCEMENT_NOT_ALLOWED"
   | "INVALID_GROUNDING"
@@ -40,6 +41,7 @@ export function inspectMissionNeeds(spec: MissionSpec, sourceGoal = spec.goal): 
     if (ids.has(need.id)) errors.add("DUPLICATE_MISSION_NEED");
     ids.add(need.id);
     if (label.length < 3 || contextOnly.test(label)) errors.add("MISSION_NEED_TOO_VAGUE");
+    if (need.kind === "PRODUCT" && /(?:\b(?:and|plus)\b|[+&])/i.test(label) && !/\b(?:bundle|combo|kit|package|set|system)\b/i.test(label)) errors.add("NON_ATOMIC_MISSION_NEED");
     if (spec.location && label === normalized(spec.location.label)) errors.add("MISSION_NEED_TOO_VAGUE");
     if (need.required === false) errors.add("UNSUPPORTED_OPTIONAL_NEED");
     if (participantNeed(need, spec)) errors.add("PARTICIPANT_CLASSIFIED_AS_NEED");

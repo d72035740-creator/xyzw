@@ -7,6 +7,9 @@ import { ContinuityError, missionSpecSchema, type MarketOffer, type MissionLocat
 import { EvidenceDecisionEngine, type DecisionPortfolio } from "./evidence-engine";
 
 type DbTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+type MissionUnderstandingInput = { goal:string; maximumAuthorityPaise?:number; location?:MissionLocationInput|string; repairAllowancePaise?:number };
+type MissionSearchInput = { missionId:string; missionVersion:number };
+type MarketGatewayFactory = (mode?: "live" | "sandbox") => MarketGateway;
 const activeStatuses = ["SELECTED", "PRESERVED"];
 function attributesSatisfy(need: MissionNeed, offer: { attributes: Record<string, unknown> }) { return Object.entries(need.requiredAttributes).every(([key,expected]) => { const actual=offer.attributes[key]; return typeof expected==="number"?typeof actual==="number"&&actual>=expected:actual===expected; }); }
 function compareLocationThenPrice(a: { evidence: Record<string, unknown> | null; pricePaise: number }, b: { evidence: Record<string, unknown> | null; pricePaise: number }) {
@@ -14,20 +17,46 @@ function compareLocationThenPrice(a: { evidence: Record<string, unknown> | null;
   return evidenceRank(a) - evidenceRank(b) || a.pricePaise - b.pricePaise;
 }
 function snapshotValues(missionId:string, offer:MarketOffer & { pricePaise: number }){return{missionId,needId:offer.needId,sourceProvider:offer.source.provider,externalId:offer.source.externalId,sourceUrl:offer.source.url,merchantName:offer.merchant.name,title:offer.title,description:offer.description,pricePaise:offer.pricePaise,currency:offer.currency,availability:offer.availability,attributes:offer.attributes,reversibility:offer.reversibility,evidence:offer.evidence,observedAt:new Date(offer.observedAt),sourceVersion:offer.sourceVersion};}
+function marketStageError(error: unknown) {
+  if (!(error instanceof ContinuityError)) return new ContinuityError("MARKET_SEARCH_FAILED", "Live market search failed", 502);
+  if (error.code === "NO_SUPPORTED_MARKET_SOURCE") return error;
+  if (["LIVE_MARKET_CONFIGURATION_MISSING", "LIVE_MARKET_PROVIDER_FAILED"].includes(error.code)) return new ContinuityError("SERPAPI_UNAVAILABLE", "The live market provider is unavailable", error.status, error.details);
+  if (["INSUFFICIENT_PRICING_EVIDENCE", "NO_FEASIBLE_MARKET_OFFER"].includes(error.code)) return new ContinuityError("NO_VALID_OFFERS", "No valid price-backed offers were found", error.status, error.details);
+  return new ContinuityError("MARKET_SEARCH_FAILED", "Live market search failed", error.status, error.details);
+}
+function evidenceStageError(error: unknown) {
+  if (error instanceof ContinuityError && error.code.startsWith("EVIDENCE_")) return new ContinuityError("EVIDENCE_UNAVAILABLE", "Market evidence is temporarily unavailable", error.status, error.details);
+  if (error instanceof ContinuityError && error.code.startsWith("MISSION_COMPILER_")) return new ContinuityError("EVIDENCE_UNAVAILABLE", "Market evidence is temporarily unavailable", error.status, error.details);
+  if (error instanceof ContinuityError && error.code === "NO_FEASIBLE_MARKET_OFFER") return new ContinuityError("NO_VALID_OFFERS", "No valid evidence-qualified offers were found", error.status, error.details);
+  return error;
+}
 
 export class ContinuityService {
-  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler(),private readonly decisionEngine=new EvidenceDecisionEngine()){}
-  async compile(input:{goal:string;maximumAuthorityPaise?:number;location?:MissionLocationInput|string;repairAllowancePaise?:number}) {
-    return this.compiler.compile(input);
+  constructor(private readonly database:Database=db,private readonly compiler=new MissionCompiler(),private readonly decisionEngine=new EvidenceDecisionEngine(),private readonly marketGatewayFactory:MarketGatewayFactory=(mode)=>new MarketGateway(mode)){}
+  async understand(input:MissionUnderstandingInput) {
+    const spec = await this.compiler.compile(input);
+    const gateway = this.marketGatewayFactory();
+    return this.database.transaction(async transaction => {
+      const [mission] = await transaction.insert(missions).values({goal:spec.goal,budgetAmount:spec.budgetPaise,deadline:spec.deadline?new Date(spec.deadline):new Date(Date.now()+7*86400000),constraints:{},status:"PLANNING"}).returning();
+      await transaction.insert(continuityMissions).values({missionId:mission.id,spec,marketMode:gateway.mode,outcomeStatus:"PLANNED",repairAllowancePaise:spec.repairAuthority.maxAdditionalSpendPaise,allowAutomaticSubstitution:spec.repairAuthority.allowAutomaticSubstitution});
+      await transaction.insert(missionEvents).values([{missionId:mission.id,type:"MISSION_CREATED",missionVersion:mission.version,data:{continuity:true,budgetPaise:spec.budgetPaise}},{missionId:mission.id,type:"MISSION_COMPILATION_COMPLETED",missionVersion:mission.version,data:{needs:spec.needs.length,marketMode:gateway.mode}}]);
+      return { missionId: mission.id, missionVersion: mission.version, spec };
+    });
   }
-  async build(input:{goal:string;maximumAuthorityPaise?:number;location?:MissionLocationInput|string;repairAllowancePaise?:number}){
-    const spec=await this.compiler.compile(input); const gateway=new MarketGateway();
-    const [mission]=await this.database.insert(missions).values({goal:spec.goal,budgetAmount:spec.budgetPaise,deadline:spec.deadline?new Date(spec.deadline):new Date(Date.now()+7*86400000),constraints:{},status:"PLANNING"}).returning();
-    await this.database.insert(continuityMissions).values({missionId:mission.id,spec,marketMode:gateway.mode,outcomeStatus:"PLANNED",repairAllowancePaise:spec.repairAuthority.maxAdditionalSpendPaise,allowAutomaticSubstitution:spec.repairAuthority.allowAutomaticSubstitution});
-    await this.database.insert(missionEvents).values([{missionId:mission.id,type:"MISSION_CREATED",missionVersion:mission.version,data:{continuity:true,budgetPaise:spec.budgetPaise}},{missionId:mission.id,type:"MISSION_COMPILATION_COMPLETED",missionVersion:mission.version,data:{needs:spec.needs.length,marketMode:gateway.mode}}]);
+  async build(input:MissionSearchInput){
+    const [mission]=await this.database.select().from(missions).where(eq(missions.id,input.missionId));
+    if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);
+    if(mission.version!==input.missionVersion)throw new ContinuityError("STALE_PLAN","Mission version is stale",409);
+    if(mission.status!=="PLANNING")throw new ContinuityError("MARKET_SEARCH_NOT_ALLOWED","Mission is not awaiting market search",409);
+    const [continuity]=await this.database.select().from(continuityMissions).where(eq(continuityMissions.missionId,mission.id));
+    if(!continuity)throw new ContinuityError("MISSION_NOT_FOUND","Compiled mission specification not found",404);
+    const spec=missionSpecSchema.parse(continuity.spec);
+    const gateway=this.marketGatewayFactory(continuity.marketMode as "live" | "sandbox");
     try{
       const context={missionId:mission.id,locationLabel:spec.location?.label,latitude:spec.location?.latitude,longitude:spec.location?.longitude};
-      const groups=await gateway.search(spec.needs,context); const offersByNeed=new Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>();
+      let groups;
+      try { groups=await gateway.search(spec.needs,context); } catch(error) { throw marketStageError(error); }
+      const offersByNeed=new Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>();
       let marketError: ContinuityError | undefined;
       for(const group of groups){
         const pricedOffers=group.offers.filter(hasKnownPrice);
@@ -35,19 +64,20 @@ export class ContinuityService {
         if(pricedOffers.length){const saved=await this.database.insert(marketOfferSnapshots).values(pricedOffers.map(o=>snapshotValues(mission.id,o))).returning();offersByNeed.set(group.need.id,saved);}
         marketError ??= group.error;
       }
-      if(marketError) throw marketError;
+      if(marketError) throw marketStageError(marketError);
       const candidateMap=new Map([...offersByNeed].map(([needId,offers])=>[needId,offers.map(offer=>({id:offer.id,needId:offer.needId,title:offer.title,merchantName:offer.merchantName,sourceUrl:offer.sourceUrl,sourceProvider:offer.sourceProvider,pricePaise:offer.pricePaise,attributes:offer.attributes,evidence:offer.evidence}))]));
-      const decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live");
+      let decision;
+      try { decision=await this.decisionEngine.decide(mission.id,spec,candidateMap,gateway.mode==="live"); } catch(error) { throw evidenceStageError(error); }
       if(decision.evidence.length)await this.database.insert(productEvidence).values(decision.evidence);
       if(decision.assessments.length)await this.database.insert(candidateAssessments).values(decision.assessments.map(assessment=>({missionId:mission.id,needId:assessment.needId,offerSnapshotId:assessment.offerSnapshotId,assessment,utilityScore:assessment.scores.utility})));
       await this.database.insert(decisionRuns).values({missionId:mission.id,profile:decision.profile,weights:decision.weights,portfolios:decision.portfolios,selectedPortfolio:decision.selectedPortfolio,status:"SUCCEEDED"});
       const chosen=decision.portfolios.find(portfolio=>portfolio.type===decision.selectedPortfolio);
-      return await this.reservePlan(mission.id,spec,offersByNeed,chosen?.itemSnapshotIds);
-    }catch(error){await this.database.update(missions).set({status:"INVALIDATED",updatedAt:new Date()}).where(eq(missions.id,mission.id));throw error;}
+      return await this.reservePlan(mission.id,input.missionVersion,spec,offersByNeed,chosen?.itemSnapshotIds);
+    }catch(error){await this.database.update(missions).set({status:"INVALIDATED",updatedAt:new Date()}).where(and(eq(missions.id,mission.id),eq(missions.version,input.missionVersion),eq(missions.status,"PLANNING")));throw error;}
   }
-  private async reservePlan(missionId:string,spec:ReturnType<typeof missionSpecSchema.parse>,groups:Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>,selectedSnapshotIds:string[]=[]){
+  private async reservePlan(missionId:string,expectedVersion:number,spec:ReturnType<typeof missionSpecSchema.parse>,groups:Map<string,(typeof marketOfferSnapshots.$inferSelect)[]>,selectedSnapshotIds:string[]=[]){
     const preferred=new Set(selectedSnapshotIds);
-    return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);const selected=spec.needs.map(need=>{const candidates=(groups.get(need.id)??[]).filter(o=>attributesSatisfy(need,o)).sort((a,b)=>Number(preferred.has(b.id))-Number(preferred.has(a.id))||compareLocationThenPrice(a,b));if(!candidates[0])throw new ContinuityError("NO_FEASIBLE_MARKET_OFFER",`No price-backed offer satisfies ${need.label}`,409,{needId:need.id});return{need,offer:candidates[0]};});const total=selected.reduce((n,x)=>n+x.offer.pricePaise*x.need.quantity,0);if(total>mission.budgetAmount)throw new ContinuityError("BUDGET_EXCEEDED","Live mission exceeds maximum authority",409,{budgetPaise:mission.budgetAmount,informationalTotal:total});await tx.update(missions).set({status:"RESERVING",updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(continuitySelections).values(selected.map(x=>({missionId,needId:x.need.id,snapshotId:x.offer.id,reservedPricePaise:x.offer.pricePaise*x.need.quantity,status:"SELECTED"})));const version=mission.version+1;await tx.update(missions).set({status:"READY_TO_COMMIT",reservedAmount:total,version,updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(missionEvents).values([{missionId,type:"CONTINUITY_AUTHORITY_RESERVED",missionVersion:version,data:{amount:total,components:selected.length,authorityType:"MISSIONPAY_LOGICAL_FINANCIAL_AUTHORITY",locationLabel:spec.location?.label??null}},{missionId,type:"MISSION_READY_TO_COMMIT",missionVersion:version,data:{reservedAmount:total,optimization:"EVIDENCE_DECISION_ENGINE"}}]);return this.get(missionId,tx);});
+    return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);if(mission.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission changed during market search",409);if(mission.status!=="PLANNING")throw new ContinuityError("MARKET_SEARCH_NOT_ALLOWED","Mission is not awaiting market search",409);const selected=spec.needs.map(need=>{const candidates=(groups.get(need.id)??[]).filter(o=>attributesSatisfy(need,o)).sort((a,b)=>Number(preferred.has(b.id))-Number(preferred.has(a.id))||compareLocationThenPrice(a,b));if(!candidates[0])throw new ContinuityError("NO_VALID_OFFERS",`No price-backed offer satisfies ${need.label}`,409,{needId:need.id});return{need,offer:candidates[0]};});const total=selected.reduce((n,x)=>n+x.offer.pricePaise*x.need.quantity,0);if(total>mission.budgetAmount)throw new ContinuityError("BUDGET_EXCEEDED","Live mission exceeds maximum authority",409,{budgetPaise:mission.budgetAmount,informationalTotal:total});await tx.update(missions).set({status:"RESERVING",updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(continuitySelections).values(selected.map(x=>({missionId,needId:x.need.id,snapshotId:x.offer.id,reservedPricePaise:x.offer.pricePaise*x.need.quantity,status:"SELECTED"})));const version=mission.version+1;await tx.update(missions).set({status:"READY_TO_COMMIT",reservedAmount:total,version,updatedAt:new Date()}).where(eq(missions.id,mission.id));await tx.insert(missionEvents).values([{missionId,type:"CONTINUITY_AUTHORITY_RESERVED",missionVersion:version,data:{amount:total,components:selected.length,authorityType:"MISSIONPAY_LOGICAL_FINANCIAL_AUTHORITY",locationLabel:spec.location?.label??null}},{missionId,type:"MISSION_READY_TO_COMMIT",missionVersion:version,data:{reservedAmount:total,optimization:"EVIDENCE_DECISION_ENGINE"}}]);return this.get(missionId,tx);});
   }
   async get(missionId:string,database:Database|DbTransaction=this.database){
     const [mission]=await database.select().from(missions).where(eq(missions.id,missionId));if(!mission)return null;

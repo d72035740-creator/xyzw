@@ -13,8 +13,8 @@ export async function POST(request: Request) {
   try {
     const parsed = schema.safeParse(await request.json());
     if (!parsed.success) return Response.json({ error: { code: "INVALID_REQUEST", message: "Mission request is invalid" } }, { status: 400 });
-    const spec = await continuityService.compile(parsed.data);
-    return Response.json({ ...spec, location: spec.location ? { source: spec.location.source, label: spec.location.label } : undefined });
+    const understanding = await continuityService.understand(parsed.data);
+    return Response.json({ missionId: understanding.missionId, missionVersion: understanding.missionVersion, ...understanding.spec, location: understanding.spec.location ? { source: understanding.spec.location.source, label: understanding.spec.location.label } : undefined });
   } catch (error) {
     return continuityErrorResponse(error);
   }
