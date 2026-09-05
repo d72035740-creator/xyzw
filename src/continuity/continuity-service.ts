@@ -14,6 +14,13 @@ type MarketGatewayFactory = (mode?: "live" | "sandbox") => MarketGateway;
 const activeStatuses = ["SELECTED", "PRESERVED"];
 function marketDiagnostic(event:string,data:Record<string,unknown>){console.info(event,data);}
 function attributesSatisfy(need: MissionNeed, offer: { attributes: Record<string, unknown> }) { return Object.entries(need.requiredAttributes).every(([key,expected]) => { const actual=offer.attributes[key]; return typeof expected==="number"?typeof actual==="number"&&actual>=expected:actual===expected; }); }
+function normalizedIdentity(value: string) { return value.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 160); }
+function confirmsSelectedOffer(selection: { externalId: string | null; sourceUrl: string | null; merchantName: string; title: string; sourceProvider: string }, offer: MarketOffer & { pricePaise: number }) {
+  if (offer.source.provider !== selection.sourceProvider) return false;
+  if (selection.externalId) return offer.source.externalId === selection.externalId;
+  if (selection.sourceUrl && offer.source.url) return selection.sourceUrl === offer.source.url && normalizedIdentity(selection.merchantName) === normalizedIdentity(offer.merchant.name);
+  return normalizedIdentity(selection.title) === normalizedIdentity(offer.title) && normalizedIdentity(selection.merchantName) === normalizedIdentity(offer.merchant.name);
+}
 function compareLocationThenPrice(a: { evidence: Record<string, unknown> | null; pricePaise: number }, b: { evidence: Record<string, unknown> | null; pricePaise: number }) {
   const evidenceRank = (offer: typeof a) => offer.evidence?.locationCompatibility === "SUPPORTED_EVIDENCE" ? 0 : 1;
   return evidenceRank(a) - evidenceRank(b) || a.pricePaise - b.pricePaise;
@@ -142,7 +149,7 @@ export class ContinuityService {
   }
 
   async replace(missionId:string,needId:string,expectedVersion:number){return this.database.transaction(async tx=>{const [mission]=await tx.select().from(missions).where(eq(missions.id,missionId)).for("update");if(!mission)throw new ContinuityError("MISSION_NOT_FOUND","Mission not found",404);if(mission.version!==expectedVersion)throw new ContinuityError("STALE_PLAN","Mission version is stale",409);if(!["READY_TO_COMMIT","PAID"].includes(mission.status))throw new ContinuityError("REPAIR_NOT_ALLOWED","Mission is not repairable in its current state",409);const [current]=await tx.select().from(continuitySelections).where(and(eq(continuitySelections.missionId,missionId),eq(continuitySelections.needId,needId),inArray(continuitySelections.status,[...activeStatuses,"DEGRADED"]))).for("update");if(!current)throw new ContinuityError("NEED_NOT_SELECTED","Selected need not found",404);const [alternative]=await tx.select().from(marketOfferSnapshots).where(and(eq(marketOfferSnapshots.missionId,missionId),eq(marketOfferSnapshots.needId,needId),ne(marketOfferSnapshots.id,current.snapshotId))).orderBy(marketOfferSnapshots.pricePaise).limit(1);if(!alternative)throw new ContinuityError("NO_REPLACEMENT","No alternate observed offer is available",409);const [continuity]=await tx.select().from(continuityMissions).where(eq(continuityMissions.missionId,missionId));const delta=alternative.pricePaise-current.reservedPricePaise;if(mission.status==="PAID"&&delta>0){const outcomeStatus=continuity.allowAutomaticSubstitution&&delta<=continuity.repairAllowancePaise?"REPAIR_PAYMENT_REQUIRED":"HUMAN_REAUTH_REQUIRED";await tx.update(continuityMissions).set({outcomeStatus,updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionOutcomeEvents).values({missionId,needId,type:"CONTINUITY_REPAIR_PROPOSED",data:{oldPricePaise:current.reservedPricePaise,newPricePaise:alternative.pricePaise,additionalSpendPaise:delta,withinRepairAuthority:delta<=continuity.repairAllowancePaise}});return this.get(missionId,tx);}const nextReserved=mission.status==="PAID"?mission.reservedAmount:mission.reservedAmount-current.reservedPricePaise+alternative.pricePaise;if(nextReserved+mission.committedAmount>mission.budgetAmount)throw new ContinuityError("HUMAN_REAUTH_REQUIRED","Replacement exceeds initial authority",409,{additionalAuthorityPaise:nextReserved+mission.committedAmount-mission.budgetAmount});await tx.update(continuitySelections).set({status:"REPLACED",updatedAt:new Date()}).where(eq(continuitySelections.id,current.id));await tx.insert(continuitySelections).values({missionId,needId,snapshotId:alternative.id,status:"SELECTED",reservedPricePaise:alternative.pricePaise,replacedSelectionId:current.id});const version=mission.version+1;await tx.update(missions).set({reservedAmount:nextReserved,version,updatedAt:new Date()}).where(eq(missions.id,missionId));if(mission.status==="PAID")await tx.update(continuityMissions).set({outcomeStatus:"ACTIVE",updatedAt:new Date()}).where(eq(continuityMissions.missionId,missionId));await tx.insert(missionEvents).values({missionId,type:"MINIMAL_LIVE_REPAIR_COMPLETED",missionVersion:version,data:{needId,preservedCount:missionSpecSchema.parse(continuity.spec).needs.length-1,oldPricePaise:current.reservedPricePaise,newPricePaise:alternative.pricePaise,refundRequiredPaise:Math.max(0,-delta)}});return this.get(missionId,tx);});}
-  async replaceFresh(missionId: string, needId: string, expectedVersion: number) {
+  async replaceFresh(missionId: string, needId: string, expectedVersion: number, skipRevalidation = false) {
     const before = await this.get(missionId);
     if (!before) throw new ContinuityError("MISSION_NOT_FOUND", "Mission not found", 404);
     if (before.mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409);
@@ -225,7 +232,7 @@ export class ContinuityService {
       await transaction.insert(missionEvents).values({ missionId, type: "MINIMAL_LIVE_REPAIR_COMPLETED", missionVersion: version, data: { needId, preservedCount: before.spec.needs.length - 1, oldPricePaise: current.reservedPricePaise, newPricePaise: alternative.pricePaise, freshMarketSearch: before.marketMode === "live" } });
       return { version, requiresRevalidation: before.marketMode === "live" };
     });
-    if (result.requiresRevalidation) await this.revalidate(missionId, result.version);
+    if (result.requiresRevalidation && !skipRevalidation) await this.revalidate(missionId, result.version);
     return this.getWithRepairs(missionId);
   }
 
@@ -243,7 +250,7 @@ export class ContinuityService {
     return { missionVersion: revalidated.mission.version, marketRevalidated: true };
   }
 
-  private async revalidateForPayment(missionId: string, expectedVersion: number) {
+  private async revalidateForPayment(missionId: string, expectedVersion: number): Promise<NonNullable<Awaited<ReturnType<ContinuityService["get"]>>>> {
     const current = await this.get(missionId);
     if (!current) throw new ContinuityError("MISSION_NOT_FOUND", "Mission not found", 404);
     if (current.mission.version !== expectedVersion) throw new ContinuityError("STALE_PLAN", "Mission version is stale", 409);
@@ -254,7 +261,17 @@ export class ContinuityService {
       const offer: MarketOffer = { id: selection.snapshotId, needId: selection.needId, source: { provider: selection.sourceProvider, externalId: selection.externalId ?? undefined, url: selection.sourceUrl ?? undefined }, merchant: { name: selection.merchantName }, title: selection.title, pricePaise: selection.pricePaise, currency: "INR", availability: selection.availability as MarketOffer["availability"], observedAt: selection.observedAt.toISOString(), sourceVersion: selection.sourceVersion, attributes: selection.attributes };
       return { selection, need, offer: await gateway.revalidate(offer, need, { missionId, locationLabel: current.spec.location?.label, latitude: current.spec.location?.latitude, longitude: current.spec.location?.longitude }).catch(() => null) };
     }));
-    const uncertain = results.filter((result) => result.status === "rejected" || !result.value.offer || !hasKnownPrice(result.value.offer) || result.value.offer.source.provider !== result.value.selection.sourceProvider || Boolean(result.value.selection.externalId && result.value.offer.source.externalId !== result.value.selection.externalId) || !attributesSatisfy(result.value.need, result.value.offer));
+    const unconfirmed = results.filter((result) => result.status === "rejected" || !result.value.offer || !hasKnownPrice(result.value.offer) || !confirmsSelectedOffer(result.value.selection, result.value.offer));
+    if (unconfirmed.length) {
+      let repairedVersion = expectedVersion;
+      for (const result of unconfirmed) {
+        if (result.status !== "fulfilled") throw new ContinuityError("NO_REPLACEMENT", "A selected product is no longer available. Choose a replacement.", 409);
+        const repaired = await this.replaceFresh(missionId, result.value.selection.needId, repairedVersion, true);
+        repairedVersion = repaired!.mission.version;
+      }
+      return this.revalidateForPayment(missionId, repairedVersion);
+    }
+    const uncertain = results.filter((result) => result.status === "fulfilled" && (!result.value.offer || !hasKnownPrice(result.value.offer) || !attributesSatisfy(result.value.need, result.value.offer)));
     const changed = results.filter((result) => result.status === "fulfilled" && result.value.offer && hasKnownPrice(result.value.offer) && result.value.offer.pricePaise !== result.value.selection.pricePaise);
 
     if (uncertain.length || changed.length) {
